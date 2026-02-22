@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 仮想環境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# 環境変数
+.env
+
+# データキャッシュ（大きいので除外）
+data/db/*.db
+data/db/price_cache/
+data/db/earnings_cache.json
+
+# バックテスト出力（最新以外は除外してもよい）
+# output/backtest/*.csv
+
+# 一時ファイル
+_ul*
+*.log
