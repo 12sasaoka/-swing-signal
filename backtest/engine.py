@@ -49,21 +49,31 @@ logger = logging.getLogger(__name__)
 _worker_shared: dict = {}
 
 
-def _init_phase1_worker(spy_df, market_ok, warmup_days, earnings_dates):
+def _init_phase1_worker(spy_df, market_ok, warmup_days, earnings_dates, quarterly_data=None):
     """Phase1ワーカーの初期化（プロセスごとに1回実行）。
 
     spy_df と market_ok はワーカー間で共有（spawn時に各プロセスへコピー）。
-    バックテストウェイト（Momentum 100%）もここで設定する。
+    quarterly_data が渡された場合は時系列対応のウェイト（M=60%, Q=30%, S=10%）を設定する。
+    quarterly_data が None の場合は Momentum=100% フォールバック。
     earnings_dates: ticker → sorted list of earnings date strings (YYYY-MM-DD)
     """
     import config.settings as cfg
-    cfg.FACTOR_WEIGHTS = cfg.FactorWeights(
-        momentum=1.00, value=0.00, quality=0.00, sentiment=0.00,
-    )
+    if quarterly_data:
+        # 時系列 Quality 有効: M=65%, Q=35%
+        # Sentiment はバックテストでは 0%（ライブでは Claude AI が担当）
+        cfg.FACTOR_WEIGHTS = cfg.FactorWeights(
+            momentum=0.65, value=0.00, quality=0.35, sentiment=0.00,
+        )
+    else:
+        # フォールバック: Momentum のみ（ルックアヘッドバイアス回避）
+        cfg.FACTOR_WEIGHTS = cfg.FactorWeights(
+            momentum=1.00, value=0.00, quality=0.00, sentiment=0.00,
+        )
     _worker_shared["spy_df"] = spy_df
     _worker_shared["market_ok"] = market_ok
     _worker_shared["warmup_days"] = warmup_days
     _worker_shared["earnings_dates"] = earnings_dates or {}
+    _worker_shared["quarterly_data"] = quarterly_data or {}
 
 
 def _score_ticker_phase1(args):
@@ -105,15 +115,35 @@ def _score_ticker_phase1(args):
             # スコアリング
             window_df = df.iloc[: i + 1]
             try:
+                # 時系列対応: その日時点で公表済みの最新四半期データを使用
+                quarterly_data = _worker_shared.get("quarterly_data", {})
+                if quarterly_data:
+                    from data.quarterly_fetcher import get_fundamentals_as_of
+                    hist_fund = get_fundamentals_as_of(ticker, current_date_str, quarterly_data)
+                else:
+                    hist_fund = fundamentals
+
                 result = _score_ticker(
                     ticker=ticker,
                     sector=sector,
                     price_df=window_df,
-                    fundamentals=fundamentals,
+                    fundamentals=hist_fund,
                     headlines=None,
-                    claude_score=None,
+                    claude_score=None,  # バックテストは Sentiment=0%（ライブは Claude AI）
                     spy_df=spy_df,
                 )
+
+                # ---- 動的重み正規化 ----
+                # quality データがない期間（2019年など）は
+                # quality の重みをモメンタムに再配分して閾値スケールを維持する
+                # quality あり: M=65%, Q=35%  → composite スケール維持
+                # quality なし: M=65/65=100%  → Momentum のみ（スケール維持）
+                if quarterly_data and hist_fund is None:
+                    import numpy as _np
+                    from strategy.scorer import determine_signal as _det_sig
+                    # quality データなし → Momentum=100% で再計算
+                    result.final_score = float(_np.clip(result.momentum_score, -1.0, 1.0))
+                    result.signal = _det_sig(result.final_score)
             except Exception:
                 continue
 
@@ -121,6 +151,18 @@ def _score_ticker_phase1(args):
                 continue
             if result.risk is None:
                 continue
+
+            # ---- 出来高確認フィルター ----
+            # シグナル日の出来高が過去N日平均の VOLUME_FILTER_MULTIPLIER 倍以上か確認
+            if (
+                VOLUME_FILTER_MULTIPLIER > 0
+                and "Volume" in window_df.columns
+                and len(window_df) > VOLUME_FILTER_PERIOD
+            ):
+                current_vol = float(window_df["Volume"].iloc[-1])
+                avg_vol = float(window_df["Volume"].iloc[-(VOLUME_FILTER_PERIOD + 1):-1].mean())
+                if avg_vol > 0 and current_vol < avg_vol * VOLUME_FILTER_MULTIPLIER:
+                    continue  # 出来高不足 → スキップ
 
             entry_row = df.iloc[i + 1]
             entry_price = float(entry_row["Open"])
@@ -190,9 +232,25 @@ STAGED_TIMEOUT = [
 # 絶対タイムアウト（無条件で強制決済）
 MAX_HOLD_DAYS = 90
 
-# トレーリングストップ（シャンデリア・エグジット）
-# 保有中の最高値から ATR × この倍率 だけ下落したら利確決済
+# トレーリングストップ（シャンデリア・エグジット）デフォルト倍率
+# 含み益が少ない初期段階ではこの倍率を使用
 TRAILING_STOP_ATR_MULTIPLIER = 3.5
+
+# 段階的トレーリングストップ: (最小含み益 ATR倍率, trail 倍率)
+# 含み益が閾値以上になったら trail 倍率を縮小して利益をロック
+# 降順で定義（大きい含み益から優先評価）
+PROGRESSIVE_TRAIL_LEVELS: list[tuple[float, float]] = [
+    (6.0, 2.0),  # 含み益 ≥ 6.0 ATR → 最高値 − ATR×2.0（タイト）
+    (4.0, 2.5),  # 含み益 ≥ 4.0 ATR → 最高値 − ATR×2.5
+    (2.0, 3.0),  # 含み益 ≥ 2.0 ATR → 最高値 − ATR×3.0
+]
+
+# ブレイクイーブン移動トリガー: 含み益がこの ATR 倍率以上で SL ≥ エントリー価格を保証
+BREAKEVEN_TRIGGER_ATR: float = 1.0
+
+# 出来高確認フィルター（エントリーシグナル時点）
+VOLUME_FILTER_MULTIPLIER: float = 1.35   # 当日出来高 ≥ N日平均 × 1.35
+VOLUME_FILTER_PERIOD: int = 20           # 平均算出期間（営業日）
 
 # ウォームアップ日数（200日MAのため最低200日必要）
 WARMUP_DAYS = 200
@@ -307,6 +365,7 @@ def run_signal_backtest(
     fund_data: dict[str, dict[str, Any]],
     spy_df: pd.DataFrame | None = None,
     earnings_dates: dict[str, list[str]] | None = None,
+    quarterly_data: dict[str, dict] | None = None,
 ) -> SignalBacktestResult:
     """シグナルバックテストを実行する。
 
@@ -315,8 +374,11 @@ def run_signal_backtest(
         price_data:     ティッカー → OHLCV DataFrame。
         fund_data:      ティッカー → ファンダメンタル辞書（現時点の値を全期間に適用）。
         spy_df:         SPY の OHLCV DataFrame（市場環境フィルター用、Noneならフィルター無効）。
-        earnings_dates: ティッカー → 決算日リスト（YYYY-MM-DD、昇順）。
-                        Noneの場合は決算フィルター無効。
+        earnings_dates:  ティッカー → 決算日リスト（YYYY-MM-DD、昇順）。
+                         Noneの場合は決算フィルター無効。
+        quarterly_data:  ティッカー → 四半期財務データ辞書。
+                         Noneの場合は Momentum=100% フォールバック（ルックアヘッドバイアス回避）。
+                         data.quarterly_fetcher.fetch_quarterly_data() の戻り値を渡すこと。
 
     Returns:
         SignalBacktestResult。
@@ -369,10 +431,15 @@ def run_signal_backtest(
     chunksize = max(1, total_tasks // (n_workers * 4))
     completed = 0
 
+    if quarterly_data:
+        logger.info("四半期財務データ: %d 銘柄分 (M=60%%, Q=30%%, S=10%%)", len(quarterly_data))
+    else:
+        logger.info("四半期財務データなし → Momentum=100%% フォールバック")
+
     with mp.Pool(
         processes=n_workers,
         initializer=_init_phase1_worker,
-        initargs=(spy_df, market_ok, WARMUP_DAYS, earnings_dates or {}),
+        initargs=(spy_df, market_ok, WARMUP_DAYS, earnings_dates or {}, quarterly_data or {}),
     ) as pool:
         for ticker_candidates in pool.imap_unordered(
             _score_ticker_phase1, tasks, chunksize=chunksize,
@@ -553,6 +620,45 @@ def run_signal_backtest(
     return _aggregate_signal_results(all_trades)
 
 
+def _get_trail_level(
+    highest_high: float,
+    entry_price: float,
+    atr: float,
+) -> float:
+    """段階的トレーリングストップの水準を返す。
+
+    含み益（ATR倍率）に応じてトレール倍率を縮小し、利益をロックする。
+    BREAKEVEN_TRIGGER_ATR 以上の含み益では SL ≥ エントリー価格を保証（床）。
+
+    Args:
+        highest_high: 保有中の最高値。
+        entry_price:  エントリー価格。
+        atr:          エントリー時点のATR値。
+
+    Returns:
+        トレーリングストップ価格。
+    """
+    if atr <= 0:
+        return highest_high - atr * TRAILING_STOP_ATR_MULTIPLIER
+
+    peak_profit_atr = (highest_high - entry_price) / atr
+
+    # 段階的倍率: 含み益大きいほどタイトに
+    trail_mult = TRAILING_STOP_ATR_MULTIPLIER
+    for min_atr, mult in PROGRESSIVE_TRAIL_LEVELS:
+        if peak_profit_atr >= min_atr:
+            trail_mult = mult
+            break
+
+    trail = highest_high - atr * trail_mult
+
+    # ブレイクイーブン床: 含み益 ≥ BREAKEVEN_TRIGGER_ATR → SL はエントリー価格以上
+    if peak_profit_atr >= BREAKEVEN_TRIGGER_ATR:
+        trail = max(trail, entry_price)
+
+    return trail
+
+
 def _simulate_trade(
     ticker: str,
     signal: str,
@@ -605,10 +711,9 @@ def _simulate_trade(
                 sl_price=sl_price, tp_price=0.0,
             )
 
-        # トレーリングストップ判定（シャンデリア・エグジット）
-        # 最高値 - ATR×3.0 を下回ったら利確（ただしエントリー価格以上のときのみ）
-        trail_level = highest_high - atr * TRAILING_STOP_ATR_MULTIPLIER
-        if trail_level > entry_price and close <= trail_level:
+        # トレーリングストップ判定（段階的トレーリング + ブレイクイーブン床）
+        trail_level = _get_trail_level(highest_high, entry_price, atr)
+        if trail_level >= entry_price and close <= trail_level:
             pl_pct = (trail_level - entry_price) / entry_price
             return TradeResult(
                 ticker=ticker, signal=signal, signal_date=signal_date,
@@ -688,9 +793,9 @@ def _check_exit(
             sl_price=position.sl_price, tp_price=0.0,
         ), highest_high
 
-    # トレーリングストップ判定（シャンデリア・エグジット）
-    trail_level = highest_high - atr * TRAILING_STOP_ATR_MULTIPLIER
-    if trail_level > position.entry_price and close <= trail_level:
+    # トレーリングストップ判定（段階的トレーリング + ブレイクイーブン床）
+    trail_level = _get_trail_level(highest_high, position.entry_price, atr)
+    if trail_level >= position.entry_price and close <= trail_level:
         pl_pct = (trail_level - position.entry_price) / position.entry_price
         return TradeResult(
             ticker=position.ticker, signal=position.signal,

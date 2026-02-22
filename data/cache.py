@@ -388,6 +388,59 @@ class CacheDB:
     # ユーティリティ
     # ================================================================
 
+    # ================================================================
+    # quarterly_fundamentals CRUD
+    # ================================================================
+
+    def upsert_quarterly_data(self, ticker: str, data: dict) -> None:
+        """四半期財務データを保存する（JSON形式）。
+
+        Args:
+            ticker: ティッカーシンボル。
+            data:   {"quarters": {...}, "surprise": {...}} の辞書。
+        """
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO quarterly_fundamentals (ticker, fetched_at, data_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    fetched_at = excluded.fetched_at,
+                    data_json  = excluded.data_json
+                """,
+                (ticker, now, json.dumps(data, ensure_ascii=False)),
+            )
+
+    def get_quarterly_data(self, ticker: str, max_age_days: int = 30) -> dict | None:
+        """四半期財務データを取得する。
+
+        Args:
+            ticker:       ティッカーシンボル。
+            max_age_days: キャッシュ有効期間（日数）。デフォルト30日。
+
+        Returns:
+            四半期データ辞書。キャッシュ切れまたはデータなしの場合は None。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT fetched_at, data_json FROM quarterly_fundamentals WHERE ticker = ?",
+                (ticker,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        fetched_at = datetime.strptime(row["fetched_at"], "%Y-%m-%d %H:%M:%S")
+        if datetime.now() - fetched_at > timedelta(days=max_age_days):
+            return None
+
+        return json.loads(row["data_json"])
+
+    # ================================================================
+    # ユーティリティ
+    # ================================================================
+
     def get_table_counts(self) -> dict[str, int]:
         """各テーブルのレコード数を返す（デバッグ・確認用）。
 
@@ -396,7 +449,10 @@ class CacheDB:
         """
         counts: dict[str, int] = {}
         with self._connect() as conn:
-            for table in ("price_history", "fundamentals", "signals_log", "screening_cache"):
+            for table in (
+                "price_history", "fundamentals", "signals_log",
+                "screening_cache", "quarterly_fundamentals",
+            ):
                 row = conn.execute(f"SELECT COUNT(*) as cnt FROM {table}").fetchone()
                 counts[table] = row["cnt"] if row else 0
         return counts
@@ -405,7 +461,7 @@ class CacheDB:
         """指定テーブルの全レコードを削除する。
 
         Args:
-            table_name: テーブル名（price_history / fundamentals / signals_log）。
+            table_name: テーブル名。
 
         Returns:
             削除されたレコード数。
@@ -413,7 +469,10 @@ class CacheDB:
         Raises:
             ValueError: 不正なテーブル名が指定された場合。
         """
-        allowed = {"price_history", "fundamentals", "signals_log", "screening_cache"}
+        allowed = {
+            "price_history", "fundamentals", "signals_log",
+            "screening_cache", "quarterly_fundamentals",
+        }
         if table_name not in allowed:
             raise ValueError(f"不正なテーブル名: {table_name}（許可: {allowed}）")
 
@@ -474,5 +533,12 @@ CREATE TABLE IF NOT EXISTS screening_cache (
     key        TEXT NOT NULL PRIMARY KEY,
     data_json  TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+
+CREATE TABLE IF NOT EXISTS quarterly_fundamentals (
+    ticker     TEXT NOT NULL PRIMARY KEY,
+    fetched_at TEXT NOT NULL,
+    data_json  TEXT NOT NULL
 );
 """

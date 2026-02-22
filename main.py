@@ -535,11 +535,20 @@ def _run_backtest(args: argparse.Namespace) -> None:
     ed_count = sum(1 for v in earnings_dates.values() if v)
     print(f"  → {ed_count} / {len(tickers)} 銘柄で決算日データあり")
 
+    # Step 4.8: 四半期財務データ取得（時系列 Quality/Sentiment 対応）
+    print("⏳ [4.8/5] 四半期財務データ取得中（時系列 Quality/Sentiment 用）...")
+    from data.quarterly_fetcher import fetch_quarterly_data
+    quarterly_data = fetch_quarterly_data(tickers, db=db)
+    q_count = sum(1 for v in quarterly_data.values() if v.get("quarters"))
+    print(f"  → {q_count} 銘柄で四半期財務データあり")
+    print(f"  → ウェイト: Momentum=65%, Quality=35%, Sentiment=0%（ライブは Claude AI）")
+
     # Step 5: シグナルバックテスト
     print("⏳ [5/5] バックテスト実行中...")
     sig_result = run_signal_backtest(
         tickers, price_data, fund_data,
         spy_df=spy_df, earnings_dates=earnings_dates,
+        quarterly_data=quarterly_data,
     )
     scr_result = run_screening_backtest(tickers, price_data)
 

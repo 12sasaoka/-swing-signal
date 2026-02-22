@@ -27,8 +27,9 @@ MAX_POSITIONS = 11
 RISK_PER_TRADE = 0.0070    # 1トレードあたり許容リスク = 総資産の0.70%
 MAX_ALLOC_PCT = 0.095       # 1トレード最大配分 = 総資産の9.5%
 MIN_RISK_RATIO = 0.005      # 最低リスク距離 = 0.5%（極端低ボラ対策）
+SIGNAL_FILTER = None            # None or list: e.g. ["STRONG_BUY"] or ["BUY"] or None(全件)
 
-CSV_PATH = r"C:\Users\mh121\OneDrive\Desktop\swing_signal\output\backtest\signal_backtest_20260222_092959.csv"
+CSV_PATH = r"C:\Users\mh121\OneDrive\Desktop\swing_signal\output\backtest\signal_backtest_20260222_122037.csv"
 
 RESULT_LABELS = {
     "sl_hit":        "SL Hit",
@@ -295,4 +296,7 @@ def simulate(trades: list[Trade]) -> None:
 
 if __name__ == "__main__":
     trades = load_trades(CSV_PATH)
+    if SIGNAL_FILTER:
+        trades = [t for t in trades if t.signal in SIGNAL_FILTER]
+        print(f"[SIGNAL_FILTER={SIGNAL_FILTER}] {len(trades)}件に絞り込み")
     simulate(trades)
