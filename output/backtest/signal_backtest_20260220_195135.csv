@@ -1,0 +1,2 @@
+﻿ticker,signal,signal_date,entry_date,entry_price,exit_date,exit_price,result,pl_pct,sl_price,tp_price
+MU,BUY,2026-01-13,2026-01-14,334.84,2026-01-21,384.54,tp_hit,14.84,311.08,384.54
