@@ -23,9 +23,9 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 INITIAL_CAPITAL = 4000.0
-MAX_POSITIONS = 12
-RISK_PER_TRADE = 0.0075    # 1トレードあたり許容リスク = 総資産の0.75%
-MAX_ALLOC_PCT = 0.10        # 1トレード最大配分 = 総資産の10%
+MAX_POSITIONS = 11
+RISK_PER_TRADE = 0.0070    # 1トレードあたり許容リスク = 総資産の0.70%
+MAX_ALLOC_PCT = 0.095       # 1トレード最大配分 = 総資産の9.5%
 MIN_RISK_RATIO = 0.005      # 最低リスク距離 = 0.5%（極端低ボラ対策）
 
 CSV_PATH = r"C:\Users\mh121\OneDrive\Desktop\swing_signal\output\backtest\signal_backtest_20260222_092959.csv"
