@@ -472,52 +472,58 @@ def _run_screening(args: argparse.Namespace) -> None:
 # ============================================================
 
 def _run_backtest(args: argparse.Namespace) -> None:
-    """直近3年バックテスト（シグナル損益 + スクリーニング精度）。"""
-    from backtest.engine import run_signal_backtest, run_screening_backtest
-    from backtest.report import (
-        print_signal_backtest, save_signal_backtest_csv,
-        print_screening_backtest, save_screening_backtest_csv,
-    )
-    from config.universe import get_all_tickers
+    """直近5年バックテスト（STRONG_BUY trail×4.0 vs trail×4.5 比較）。
+
+    Phase1（銘柄スコアリング）を1回だけ実行し、
+    Phase2（ポートフォリオシミュレーション）をトレーリング幅ごとに実行することで
+    フルバックテスト2回分の時間を節約する。
+    """
+    from backtest.engine import run_signal_backtest_multi_trail
+    from backtest.report import print_signal_backtest, save_signal_backtest_csv
     from data.cache import CacheDB
     from data.fundamental_fetcher import fetch_fundamentals
     from data.price_fetcher import fetch_prices
     from data.screener import fetch_iwv_holdings, screen_tier1
 
-    print("📊 モード: バックテスト (直近5年)")
+    print("📊 モード: バックテスト (直近4年 / SB trail×4.0 vs trail×4.5 比較)")
     print()
 
     # Step 1: DB 初期化
     db = CacheDB()
     db.initialize()
 
-    # Step 2: 対象銘柄リスト（コア + Tier1通過銘柄）
-    # バックテストでは Tier2（短期価格取得が必要）をスキップし、
-    # Tier1（fast_info のみ）通過銘柄を直接7年分取得する
+    # Step 2: 対象銘柄リスト（Tier1 フィルタのみ）
+    # ※ Tier2（モメンタム上位100選）はバックテストエンジン内でローリング月次で適用する。
+    #   ここで Tier2 を適用すると「現在のスコア」でフィルタするルックアヘッドバイアスが発生するため削除。
     print("📡 対象銘柄を選定中...")
     print("  [1/2] IWV 構成銘柄を取得中...")
     iwv_tickers = fetch_iwv_holdings(db)
     print(f"    → {len(iwv_tickers)} 銘柄を取得")
 
-    print("  [2/2] Tier 1 フィルタ中（fast_info: 時価総額・出来高・株価）...")
+    print("  [2/2] Tier 1 フィルタ中（時価総額・出来高・株価）...")
     tier1_tickers = screen_tier1(iwv_tickers, db)
     print(f"    → {len(tier1_tickers)} 銘柄が通過")
 
-    core = set(get_all_tickers())
-    tickers = sorted(set(tier1_tickers) | core)
-    print(f"  コア: {len(core)} 銘柄 + Tier1: {len(tier1_tickers)} 銘柄 → 合計: {len(tickers)} 銘柄")
+    tickers = sorted(set(tier1_tickers))
+    print(f"  最終対象: {len(tickers)} 銘柄")
+    print(f"  ※ Tier2（モメンタム上位100）はエンジン内でローリング月次適用（バイアスなし）")
     print()
 
-    # Step 3: 7年分株価取得（5年 + 200MA ウォームアップ用 2年分バッファ）
-    # → 200日MAが最初の5年シグナル期間の初日から正確に計算されるよう余裕をもたせる
-    print("⏳ [1/5] 7年分の株価データ取得中（時間がかかります）...")
-    price_data = fetch_prices(tickers, db=db, period="7y", force_refresh=args.force_refresh)
+    # Step 3: 6年分株価取得（4年 + 200MA ウォームアップ用 2年分バッファ）
+    # allow_stale=True: バックテストは今日の最新データ不要、DBの履歴データをそのまま使用
+    print("⏳ [1/5] 6年分の株価データ取得中（DBキャッシュ優先）...")
+    price_data = fetch_prices(
+        tickers, db=db, period="6y",
+        force_refresh=args.force_refresh,
+        allow_stale=not args.force_refresh,
+    )
     print(f"  → {len(price_data)} 銘柄の株価を取得")
 
     # Step 3.5: SPY データ取得（市場環境フィルター用）
     print("⏳ [2/5] SPY データ取得中（市場環境フィルター用）...")
     from data.price_fetcher import fetch_price_single
-    spy_df = fetch_price_single("SPY", db=db, period="7y")
+    spy_results = fetch_prices(["SPY"], db=db, period="6y", allow_stale=not args.force_refresh)
+    spy_df = spy_results.get("SPY")
     if spy_df is not None:
         print(f"  → SPY: {len(spy_df)} 日分")
     else:
@@ -543,27 +549,53 @@ def _run_backtest(args: argparse.Namespace) -> None:
     print(f"  → {q_count} 銘柄で四半期財務データあり")
     print(f"  → ウェイト: Momentum=65%, Quality=35%, Sentiment=0%（ライブは Claude AI）")
 
-    # Step 5: シグナルバックテスト
-    print("⏳ [5/5] バックテスト実行中...")
-    sig_result = run_signal_backtest(
+    # Step 5: シグナルバックテスト（trail×4.0 と trail×4.5 を比較）
+    # Phase1（銘柄スコアリング）は1回だけ実行し、Phase2をtrail値ごとに実行
+    print("⏳ [5/5] バックテスト実行中（SB trail×4.0 と trail×4.5 を1回のPhase1で比較）...")
+    trail_results = run_signal_backtest_multi_trail(
         tickers, price_data, fund_data,
         spy_df=spy_df, earnings_dates=earnings_dates,
         quarterly_data=quarterly_data,
+        sb_trail_mults=[4.0, 4.5],
     )
-    scr_result = run_screening_backtest(tickers, price_data)
 
-    # Step 6: 結果表示
-    print_signal_backtest(sig_result)
-    print_screening_backtest(scr_result)
+    # Step 6: 結果表示（各trail値の詳細 + 比較サマリー）
+    for mult in sorted(trail_results.keys()):
+        result = trail_results[mult]
+        print(f"\n【STRONG_BUY trail×{mult:.1f}】")
+        print_signal_backtest(result)
+
+    # 比較サマリー表
+    print()
+    print("━" * 68)
+    print("  📊 STRONG_BUY トレーリング幅 比較サマリー")
+    print("━" * 68)
+    print(f"  {'trail倍率':<10} {'トレード数':>8} {'勝率':>8} {'平均損益':>10} {'累計損益':>12} {'Sharpe':>8}")
+    print("  " + "-" * 60)
+    for mult in sorted(trail_results.keys()):
+        r = trail_results[mult]
+        # 総資産換算（$4,000 スタート想定）
+        capital = 4000.0
+        slots = 12  # MAX_CONCURRENT_POSITIONS
+        total_val = capital * (1 + r.avg_pl_pct) ** r.total_trades if r.total_trades > 0 else capital
+        print(
+            f"  trail×{mult:<4.1f}   "
+            f"{r.total_trades:>8} "
+            f"{r.win_rate * 100:>7.1f}% "
+            f"{r.avg_pl_pct * 100:>+9.2f}% "
+            f"{r.total_pl_pct * 100:>+11.2f}% "
+            f"{r.sharpe_ratio:>8.2f}"
+        )
+    print("━" * 68)
 
     # Step 7: CSV 保存
     if not args.no_csv:
-        sig_path = save_signal_backtest_csv(sig_result)
-        if sig_path:
-            print(f"\n📁 シグナルバックテスト CSV: {sig_path}")
-        scr_path = save_screening_backtest_csv(scr_result)
-        if scr_path:
-            print(f"📁 スクリーニングバックテスト CSV: {scr_path}")
+        for mult in sorted(trail_results.keys()):
+            result = trail_results[mult]
+            label = f"sb_trail{mult:.1f}"
+            sig_path = save_signal_backtest_csv(result, label=label)
+            if sig_path:
+                print(f"\n📁 CSV (trail×{mult:.1f}): {sig_path}")
 
 
 # ============================================================

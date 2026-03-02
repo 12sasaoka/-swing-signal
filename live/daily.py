@@ -35,11 +35,12 @@ from backtest.engine import (
     MARKET_FILTER_MA_PERIOD,
     MAX_CONCURRENT_POSITIONS,
 )
-from config.universe import get_all_tickers, get_sector
+from config.universe import get_sector
 from data.cache import CacheDB
 from data.fundamental_fetcher import fetch_fundamentals
 from data.news_fetcher import fetch_news
 from data.price_fetcher import fetch_price_single, fetch_prices
+from data.screener import fetch_iwv_holdings, screen_tier1
 from live.notifier import send_daily_notification
 from live.tracker import (
     DEFAULT_POSITIONS_PATH,
@@ -128,8 +129,13 @@ def _do_daily(args: argparse.Namespace) -> None:
     db = CacheDB()
     db.initialize()
 
-    # ---- Step 3: 全必要銘柄の株価取得 ----
-    core_tickers = get_all_tickers()
+    # ---- Step 3a: Russell 3000 Tier1 スクリーニング ----
+    print(f"\n⏳ [0/4] 対象銘柄スクリーニング中 (Russell 3000 Tier1)...")
+    iwv_tickers = fetch_iwv_holdings(db)
+    core_tickers = screen_tier1(iwv_tickers, db)
+    print(f"  → {len(core_tickers)} 銘柄が対象")
+
+    # ---- Step 3b: 全必要銘柄の株価取得 ----
     position_tickers = [p.ticker for p in state.positions]
     all_tickers = sorted(set(core_tickers) | set(position_tickers) | {"SPY"})
 
@@ -164,6 +170,7 @@ def _do_daily(args: argparse.Namespace) -> None:
         entries = _process_entries(
             state, price_data, db, today,
             total_assets_start, dry_run,
+            tickers=core_tickers,
         )
         if entries:
             print(f"  → {len(entries)} 件の新規エントリー")
@@ -289,6 +296,7 @@ def _process_entries(
     today: str,
     total_assets: float,
     dry_run: bool,
+    tickers: list[str] | None = None,
 ) -> list[dict]:
     """新規シグナルをスキャンして空きスロットにエントリーする。"""
     from data.news_fetcher import fetch_news
@@ -296,8 +304,11 @@ def _process_entries(
     # 既存ポジションの銘柄セット（重複エントリー防止）
     held_tickers = {p.ticker for p in state.positions}
 
+    if not tickers:
+        logger.warning("対象銘柄リストが空 — エントリースキャンをスキップ")
+        return []
+
     # ファンダメンタル & ニュース取得
-    tickers = get_all_tickers()
     try:
         fund_data = fetch_fundamentals(tickers, db=db)
     except Exception:

@@ -35,7 +35,7 @@ class TradeRules:
 
     max_position_pct: float = 0.05          # 1銘柄最大ポジション (5%)
     max_sector_pct: float = 0.25            # 1セクター最大ポジション (25%)
-    hard_stop_loss_pct: float = -0.08       # ハードストップ損切り (-8%)
+    hard_stop_loss_pct: float = -0.06       # ハードストップ損切り (-6%) 【案2: りおぽん -5%ルール準拠】
     hard_take_profit_pct: float = 0.20      # ハード利確 (+20%)
     buy_threshold: float = 0.7              # BUYシグナル閾値 (スコア ≥ 0.7)
     sell_threshold: float = -0.3            # SELLシグナル閾値 (スコア ≤ -0.3)

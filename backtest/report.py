@@ -79,8 +79,13 @@ def print_signal_backtest(result: SignalBacktestResult) -> None:
 def save_signal_backtest_csv(
     result: SignalBacktestResult,
     output_dir: Path | str | None = None,
+    label: str | None = None,
 ) -> Path | None:
     """シグナルバックテスト結果をCSVに保存する。
+
+    Args:
+        label: ファイル名に付加するラベル（例: "trail4.0"）。
+               複数パラメータを比較する際にファイルを区別するために使用。
 
     Returns:
         保存したCSVファイルのパス。トレードがない場合は None。
@@ -92,10 +97,11 @@ def save_signal_backtest_csv(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = out_dir / f"signal_backtest_{timestamp}.csv"
+    suffix = f"_{label}" if label else ""
+    csv_path = out_dir / f"signal_backtest_{timestamp}{suffix}.csv"
 
     fieldnames = [
-        "ticker", "signal", "signal_date", "entry_date", "entry_price",
+        "ticker", "signal", "score", "signal_date", "entry_date", "entry_price",
         "exit_date", "exit_price", "result", "pl_pct", "sl_price", "tp_price",
     ]
 

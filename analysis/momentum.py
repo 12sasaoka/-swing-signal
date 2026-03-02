@@ -281,10 +281,11 @@ def _calc_short_term(
     """短期モメンタムスコアを算出する。
 
     サブ指標:
-      - 1週間リターン (30%): ボラ調整正規化
-      - 1ヶ月リターン (25%): ボラ調整正規化
-      - RSI(14) (30%): 順張りスコア（トレンドフォロー型）
-      - 相対出来高 (15%): clip((vol_ratio - 1.0) / 0.5, -1, 1)
+      - 1週間リターン (25%): ボラ調整正規化
+      - 1ヶ月リターン (20%): ボラ調整正規化
+      - RSI(14) (25%): 順張りスコア（トレンドフォロー型）
+      - 相対出来高 (20%): clip((vol_ratio - 1.0) / 0.5, -1, 1) 【案5: 出来高ウェイト強化 15%→20%】
+      - 旬度スコア (10%): 直近20日の上昇日比率 【案8: りおぽん旬理論の定量化】
     """
     ref_1w = _vol_adjusted_ref(daily_vol, 5, fallback=0.05)
     ref_1m = _vol_adjusted_ref(daily_vol, 21, fallback=0.10)
@@ -293,8 +294,15 @@ def _calc_short_term(
     ret_1m = _norm(_calc_return(close, 21), ref_1m)
     rsi_score = _rsi_to_score(_calc_rsi(close, TECHNICAL_PARAMS.rsi_period))
     vol_score = _calc_volume_score(volumes)
+    shun_score = _calc_shun_score(close)  # 案8: 旬度スコア
 
-    score = ret_1w * 0.30 + ret_1m * 0.25 + rsi_score * 0.30 + vol_score * 0.15
+    score = (
+        ret_1w * 0.25
+        + ret_1m * 0.20
+        + rsi_score * 0.25
+        + vol_score * 0.20
+        + shun_score * 0.10
+    )
     return float(np.clip(score, -1.0, 1.0))
 
 
@@ -350,7 +358,7 @@ def _calc_long_term(
     サブ指標:
       - 12-1ヶ月モメンタム (50%): ボラ調整正規化 ※絶対リターン維持
       - 200日MA乖離率 (30%): ボラ調整正規化
-      - 6ヶ月超過リターン vs SPY (20%): ボラ調整正規化
+      - 6ヶ月リターン (20%): ボラ調整正規化（絶対リターン）
     """
     ref_12_1m = _vol_adjusted_ref(daily_vol, 231, fallback=0.30)  # 252-21=231日
     ref_6m = _vol_adjusted_ref(daily_vol, 126, fallback=0.25)
@@ -358,16 +366,7 @@ def _calc_long_term(
 
     ret_12_1m = _norm(_calc_return_skip_recent(close, 252, 21), ref_12_1m)
     ma200_dev = _norm(_calc_ma_deviation(close, TECHNICAL_PARAMS.sma_200), ref_ma200)
-
-    # 6ヶ月超過リターン（SPYデータがあれば超過、なければ絶対）
-    stock_ret_6m = _calc_return(close, 126)
-    if spy_close is not None and len(spy_close) >= 127:
-        spy_ret_6m = _calc_return(spy_close, 126)
-        ret_6m = stock_ret_6m - spy_ret_6m  # 超過リターン
-    else:
-        ret_6m = stock_ret_6m  # fallback: 絶対リターン
-
-    ret_6m_norm = _norm(ret_6m, ref_6m)
+    ret_6m_norm = _norm(_calc_return(close, 126), ref_6m)
 
     score = ret_12_1m * 0.50 + ma200_dev * 0.30 + ret_6m_norm * 0.20
     return float(np.clip(score, -1.0, 1.0))
@@ -549,6 +548,64 @@ def _calc_ma_deviation(close: pd.Series, period: int) -> float:
 # ============================================================
 # ユーティリティ
 # ============================================================
+
+def _calc_shun_score(close: pd.Series) -> float:
+    """旬度スコアを算出する。【案8: りおぽん旬理論の定量化】
+
+    りおぽんの「上昇率ランキングに繰り返し登場する銘柄 = 旬の真っ盛り」を
+    直近20日の上昇日比率で代替実装する。
+
+    連続的にみんなが買っている銘柄（毎日コンスタントに上昇）を
+    ポジティブに評価する。
+
+    スコアリング:
+      上昇日 70%以上 (14/20日) → +1.0 (旬の真っ盛り)
+      上昇日 50%     (10/20日) →  0.0 (中立)
+      上昇日 30%以下  (6/20日) → -1.0 (売られ続けている)
+
+    Args:
+        close: 終値系列（21日以上必要）。
+
+    Returns:
+        スコア (-1.0 〜 +1.0)。データ不足時は 0.0。
+    """
+    if len(close) < 21:
+        return 0.0
+    daily_returns = close.iloc[-20:].pct_change().dropna()
+    if len(daily_returns) < 10:
+        return 0.0
+    positive_ratio = float((daily_returns > 0).sum()) / len(daily_returns)
+    # 50%が中立点、70%で+1.0、30%で-1.0
+    return float(np.clip((positive_ratio - 0.50) / 0.20, -1.0, 1.0))
+
+
+def _calc_52w_high_score(close: pd.Series) -> float:
+    """52週高値ブレイクアウトスコアを算出する。
+
+    52週高値への近接度を評価する（ブレイクアウト検出）。
+
+    スコアリング:
+      current == 52週高値 → +1.0 (新高値: 強気ブレイクアウト)
+      current = 52週高値の -15% → 0.0 (中立)
+      current = 52週高値の -30% → -1.0 (高値から大きく乖離)
+
+    Args:
+        close: 終値系列（252日以上推奨）。
+
+    Returns:
+        スコア (-1.0 〜 +1.0)。データ不足時は 0.0。
+    """
+    if len(close) < 50:
+        return 0.0
+    lookback = min(252, len(close))
+    high_52w = float(close.iloc[-lookback:].max())
+    current = float(close.iloc[-1])
+    if high_52w <= 0 or np.isnan(high_52w) or np.isnan(current):
+        return 0.0
+    proximity = (current - high_52w) / high_52w  # ≤ 0
+    # proximity=0 → score=1.0, proximity=-0.15 → score=0.0, proximity=-0.30 → score=-1.0
+    return float(np.clip((proximity + 0.15) / 0.15, -1.0, 1.0))
+
 
 def _norm(value: float, reference: float) -> float:
     """値を基準値で割って -1〜+1 にクリップする。

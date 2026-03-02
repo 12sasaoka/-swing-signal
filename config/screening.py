@@ -14,8 +14,8 @@ class ScreeningParams:
     """スクリーニング用の閾値パラメータ。"""
 
     # ---- Tier 1: ファンダメンタル事前フィルタ ----
-    min_market_cap: float = 3e8          # 最低時価総額 ($300M)
-    min_avg_volume: int = 500_000        # 最低平均出来高 (株/日)
+    min_market_cap: float = 1.5e8        # 最低時価総額 ($150M)
+    min_avg_volume: int = 300_000        # 最低平均出来高 (株/日)
     min_price: float = 5.0               # 最低株価 (ペニーストック除外)
 
     # ---- Tier 2: テクニカルフィルタ ----

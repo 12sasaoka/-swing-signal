@@ -41,6 +41,76 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# Phase1 キャッシュ
+# ============================================================
+
+import hashlib
+import pickle
+from pathlib import Path as _Path
+
+_PHASE1_CACHE_DIR = _Path(__file__).resolve().parent.parent / "data" / "db"
+_PHASE1_CACHE_FILE = _PHASE1_CACHE_DIR / "phase1_cache.pkl"
+
+
+def _compute_phase1_cache_key(tickers: list, has_quarterly: bool) -> str:
+    """Phase1キャッシュキーを計算する。
+
+    主要パラメータ + ティッカーリストのハッシュ。
+    パラメータ or 銘柄リストが変わると自動的にキャッシュが無効化される。
+    新しい株価データを取得した場合はキャッシュファイルを手動削除すること:
+      data/db/phase1_cache.pkl
+    """
+    import config.settings as _cfg
+
+    key_parts = "|".join([
+        str(has_quarterly),
+        str(WARMUP_DAYS),
+        str(VOLUME_FILTER_MULTIPLIER),
+        str(VOLUME_FILTER_PERIOD),
+        str(DIP_FILTER_ENABLED),
+        str(DIP_MIN_PCT),
+        str(DIP_MAX_PCT),
+        str(OVERBOUGHT_5D_THRESHOLD),
+        str(SPY_HOT_5D_THRESHOLD),
+        str(POST_EARNINGS_WINDOW_DAYS),
+        str(POST_EARNINGS_MIN_DROP),
+        str(POST_EARNINGS_SCORE_BONUS),
+        str(_cfg.SIGNAL_THRESHOLDS.buy),
+        str(_cfg.SIGNAL_THRESHOLDS.strong_buy),
+        ",".join(sorted(tickers)),
+    ])
+    return hashlib.md5(key_parts.encode()).hexdigest()
+
+
+def _load_phase1_cache(cache_key: str) -> list | None:
+    """キャッシュが有効なら signal_candidates を返す。なければ None。"""
+    if not _PHASE1_CACHE_FILE.exists():
+        return None
+    try:
+        with open(_PHASE1_CACHE_FILE, "rb") as f:
+            cached = pickle.load(f)
+        if cached.get("key") == cache_key:
+            candidates = cached["candidates"]
+            logger.info("Phase1キャッシュヒット: %d 件を読み込み (キー=%s...)",
+                        len(candidates), cache_key[:8])
+            return candidates
+    except Exception:
+        pass
+    return None
+
+
+def _save_phase1_cache(cache_key: str, candidates: list) -> None:
+    """signal_candidates（df フィールドなし）をキャッシュに保存する。"""
+    try:
+        # df フィールドはサイズが大きく price_data から復元可能なので除外
+        slim = [{k: v for k, v in c.items() if k != "df"} for c in candidates]
+        with open(_PHASE1_CACHE_FILE, "wb") as f:
+            pickle.dump({"key": cache_key, "candidates": slim}, f, protocol=4)
+        logger.info("Phase1キャッシュ保存: %d 件 → %s", len(slim), _PHASE1_CACHE_FILE)
+    except Exception as e:
+        logger.warning("Phase1キャッシュ保存失敗: %s", e)
+
 
 # ============================================================
 # Phase1 並列処理ワーカー
@@ -49,13 +119,18 @@ logger = logging.getLogger(__name__)
 _worker_shared: dict = {}
 
 
-def _init_phase1_worker(spy_df, market_ok, warmup_days, earnings_dates, quarterly_data=None):
+def _init_phase1_worker(
+    spy_df, market_ok, warmup_days, earnings_dates,
+    quarterly_data=None, spy_not_hot=None, sector_momentum=None,
+):
     """Phase1ワーカーの初期化（プロセスごとに1回実行）。
 
     spy_df と market_ok はワーカー間で共有（spawn時に各プロセスへコピー）。
-    quarterly_data が渡された場合は時系列対応のウェイト（M=60%, Q=30%, S=10%）を設定する。
+    quarterly_data が渡された場合は時系列対応のウェイト（M=65%, Q=35%）を設定する。
     quarterly_data が None の場合は Momentum=100% フォールバック。
     earnings_dates: ticker → sorted list of earnings date strings (YYYY-MM-DD)
+    spy_not_hot: 日付 → True(エントリーOK)/False(過熱=回避) 【案7】
+    sector_momentum: {YYYY-MM: {sector: bonus_score}} 【案4】
     """
     import config.settings as cfg
     if quarterly_data:
@@ -74,6 +149,8 @@ def _init_phase1_worker(spy_df, market_ok, warmup_days, earnings_dates, quarterl
     _worker_shared["warmup_days"] = warmup_days
     _worker_shared["earnings_dates"] = earnings_dates or {}
     _worker_shared["quarterly_data"] = quarterly_data or {}
+    _worker_shared["spy_not_hot"] = spy_not_hot or {}      # 案7
+    _worker_shared["sector_momentum"] = sector_momentum or {}  # 案4
 
 
 def _score_ticker_phase1(args):
@@ -147,6 +224,61 @@ def _score_ticker_phase1(args):
             except Exception:
                 continue
 
+            # ---- 案10: 決算後ディップ優先エントリー ----
+            # りおぽん: 「決算で売られたが内容は悪くない銘柄は良い押し目」
+            # 落ちるナイフ誤買い防止: 反発陽線 + 出来高急増を必須条件とする
+            earnings_map = _worker_shared.get("earnings_dates", {})
+            ticker_earnings = earnings_map.get(ticker, [])
+            if ticker_earnings and len(window_df) >= 2:
+                ei_post = bisect_left(ticker_earnings, current_date_str)
+                if ei_post > 0:
+                    last_earn_str = ticker_earnings[ei_post - 1]
+                    days_since = (pd.Timestamp(current_date_str) - pd.Timestamp(last_earn_str)).days
+                    if 7 <= days_since <= POST_EARNINGS_WINDOW_DAYS:
+                        # 決算前日終値を取得
+                        try:
+                            earn_dt = pd.Timestamp(last_earn_str)
+                            pre_earn_df = df.loc[:earn_dt - pd.Timedelta(days=1)]
+                            if len(pre_earn_df) >= 1:
+                                pre_earn_close = float(pre_earn_df["Close"].iloc[-1])
+                                cur_close = float(window_df["Close"].iloc[-1])
+                                drop_pct = (cur_close - pre_earn_close) / pre_earn_close
+                                if drop_pct <= POST_EARNINGS_MIN_DROP:
+                                    # 反発確認: 本日終値 > 前日終値
+                                    is_recovering = cur_close > float(window_df["Close"].iloc[-2])
+                                    # 出来高急増確認
+                                    is_high_vol = False
+                                    if "Volume" in window_df.columns and len(window_df) > VOLUME_FILTER_PERIOD:
+                                        cur_vol = float(window_df["Volume"].iloc[-1])
+                                        avg_vol_post = float(window_df["Volume"].iloc[-(VOLUME_FILTER_PERIOD + 1):-1].mean())
+                                        is_high_vol = avg_vol_post > 0 and cur_vol >= avg_vol_post * POST_EARNINGS_VOL_MULT
+                                    if is_recovering and is_high_vol:
+                                        # 条件を満たせばスコアボーナス
+                                        result.final_score = float(np.clip(
+                                            result.final_score + POST_EARNINGS_SCORE_BONUS, -1.0, 1.0
+                                        ))
+                                        from strategy.scorer import determine_signal as _det_sig_pe
+                                        result.signal = _det_sig_pe(result.final_score)
+                        except Exception:
+                            pass
+
+            # ---- 案4: セクターモメンタムボーナス ----
+            # りおぽん: 「勝ち馬セクターに乗る」
+            sector_mom_map = _worker_shared.get("sector_momentum", {})
+            if sector_mom_map:
+                current_month = current_date_str[:7]
+                # 最新の月データを逆順検索
+                for past_month in sorted(sector_mom_map.keys(), reverse=True):
+                    if past_month <= current_month:
+                        sector_bonus = sector_mom_map[past_month].get(sector, 0.0)
+                        if sector_bonus != 0.0:
+                            result.final_score = float(np.clip(
+                                result.final_score + sector_bonus, -1.0, 1.0
+                            ))
+                            from strategy.scorer import determine_signal as _det_sig_sec
+                            result.signal = _det_sig_sec(result.final_score)
+                        break
+
             if result.signal not in (BUY_SIG, STRONG_BUY_SIG):
                 continue
             if result.risk is None:
@@ -164,6 +296,57 @@ def _score_ticker_phase1(args):
                 if avg_vol > 0 and current_vol < avg_vol * VOLUME_FILTER_MULTIPLIER:
                     continue  # 出来高不足 → スキップ
 
+            # ---- 案7: 市場ディップ日スコアボーナス ----
+            # りおぽん: 「好調な上昇相場では買わない。ディップの日に仕込む」
+            # ※ハードフィルターではなくスコアボーナスに変更（機会損失を防ぐ）
+            # SPYが5日で下落している日はエントリー品質が高い → ボーナス付与
+            spy_not_hot_map = _worker_shared.get("spy_not_hot", {})
+            if spy_not_hot_map and len(window_df) >= 6:
+                # SPYが下落中(not hot)の日はスコアボーナス
+                if not spy_not_hot_map.get(current_date_str, True):
+                    # 過熱市場(SPY +5%超): 軽くペナルティ（完全ブロックはしない）
+                    result.final_score = float(np.clip(result.final_score - 0.05, -1.0, 1.0))
+                    from strategy.scorer import determine_signal as _det_sig_spy
+                    result.signal = _det_sig_spy(result.final_score)
+
+            # ---- 案9: 過熱回避スコアボーナス（銘柄レベル）----
+            # りおぽん: 「急上昇中の銘柄にも触らない」
+            # ※ハードフィルターではなくペナルティに変更（完全排除はしない）
+            if len(window_df) >= 6:
+                close_now = float(window_df["Close"].iloc[-1])
+                close_5d = float(window_df["Close"].iloc[-6])
+                if close_5d > 0:
+                    ret_5d_stock = (close_now - close_5d) / close_5d
+                    if ret_5d_stock >= OVERBOUGHT_5D_THRESHOLD:
+                        # 急騰中: スコアペナルティ（完全ブロックはしない）
+                        result.final_score = float(np.clip(result.final_score - 0.08, -1.0, 1.0))
+                        from strategy.scorer import determine_signal as _det_sig_ob
+                        result.signal = _det_sig_ob(result.final_score)
+
+            # ---- 案1: ディップ買いスコアボーナス ----
+            # りおぽん: 「直近高値から程よく引いた押し目で仕込む」
+            # ※ハードフィルターではなくスコアボーナスに変更（機会損失を防ぐ）
+            # ディップゾーン(3-15%下落)にある株は「旬を維持しつつ割安感あり」
+            if DIP_FILTER_ENABLED and len(window_df) >= DIP_LOOKBACK:
+                rolling_high = float(window_df["Close"].iloc[-DIP_LOOKBACK:].max())
+                cur_close_dip = float(window_df["Close"].iloc[-1])
+                if rolling_high > 0:
+                    dip_ratio = (rolling_high - cur_close_dip) / rolling_high
+                    if DIP_MIN_PCT <= dip_ratio <= 0.15:
+                        # 理想的なディップゾーン: ボーナス
+                        result.final_score = float(np.clip(result.final_score + 0.05, -1.0, 1.0))
+                        from strategy.scorer import determine_signal as _det_sig_dip
+                        result.signal = _det_sig_dip(result.final_score)
+                    elif dip_ratio > DIP_MAX_PCT:
+                        # 急落しすぎ(20%超): 軽くペナルティ
+                        result.final_score = float(np.clip(result.final_score - 0.05, -1.0, 1.0))
+                        from strategy.scorer import determine_signal as _det_sig_crash
+                        result.signal = _det_sig_crash(result.final_score)
+
+            # スコア調整後に再チェック（ペナルティでHOLDに格下がりした場合はスキップ）
+            if result.signal not in (BUY_SIG, STRONG_BUY_SIG):
+                continue
+
             entry_row = df.iloc[i + 1]
             entry_price = float(entry_row["Open"])
             if entry_price <= 0:
@@ -171,8 +354,6 @@ def _score_ticker_phase1(args):
 
             # 決算前エントリー禁止チェック
             # Phase2の強制決済閾値（5カレンダー日）と一致させ、同日Entry+Exit問題を防ぐ
-            earnings_map = _worker_shared.get("earnings_dates", {})
-            ticker_earnings = earnings_map.get(ticker, [])
             if ticker_earnings:
                 entry_date_chk = trading_dates[i + 1].strftime("%Y-%m-%d")
                 ei = bisect_left(ticker_earnings, entry_date_chk)
@@ -226,11 +407,22 @@ def _backtest_weights():
 
 # 段階的タイムアウト設定
 # (経過営業日, 最低含み益%) — 含み益が基準未満なら強制決済
+# 【案3: りおぽん「月7%最低ライン」準拠 + 早期パフォーマンスカット追加】
 STAGED_TIMEOUT = [
-    (30, 0.00),   # 30営業日: 含み損（< 0%）なら決済、含み益なら保有継続
+    (30, 0.00),   # 30営業日: 含み損（< 0%）なら決済（継続監視）
+    # (15, 0.05) は削除 — 優良トレードを早期に切りすぎて平均損益を悪化させた
 ]
 # 絶対タイムアウト（無条件で強制決済）
-MAX_HOLD_DAYS = 90
+# 【案11: 旬の賞味期限は最長3ヶ月 → 90日→60日】
+MAX_HOLD_DAYS = 60
+
+# ── STRONG_BUY 専用の拡張保有設定 ──────────────────────────────────
+# 地力が強いシグナルは長く持つことで大きな利益を狙う
+# BUY は通常ルール、STRONG_BUY だけここで上書き
+SB_MAX_HOLD_DAYS          = 90    # 最大保有: 60日 → 90日
+SB_TRAILING_ATR_MULT      = 4.0   # トレーリング幅（デフォルト）。run_signal_backtest の sb_trail_mult で上書き可
+SB_STAGED_TIMEOUT_ENABLED = True   # 30日タイムアウト: BUY と同様に有効のまま
+# ────────────────────────────────────────────────────────────────────
 
 # トレーリングストップ（シャンデリア・エグジット）デフォルト倍率
 # 含み益が少ない初期段階ではこの倍率を使用
@@ -247,6 +439,15 @@ PROGRESSIVE_TRAIL_LEVELS: list[tuple[float, float]] = [
 
 # ブレイクイーブン移動トリガー: 含み益がこの ATR 倍率以上で SL ≥ エントリー価格を保証
 BREAKEVEN_TRIGGER_ATR: float = 1.0
+# ブレイクイーブンラチェット: トリガー後のロック水準 = entry_price + atr × この値
+# 0.0 = 従来通り 0% ロック、0.5 = +0.5ATR（約+1〜2%）でロック
+BREAKEVEN_LOCK_ATR: float = 1.0
+
+# 【案6: 直近高値ベーストレーリング】
+# りおぽん: 「直近高値から5%以上下落したら利確検討」
+# ユーザー懸念対応: ボラ考慮 → max(5%, ATR×1.5÷高値) のルームを確保
+PEAK_TRAIL_MIN_PCT: float = 0.05    # 最低5%ルーム（安定株）
+PEAK_TRAIL_ATR_MULT: float = 1.5   # ATRベース: 1.5ATR（高ボラ株はこちらが広くなる）
 
 # 出来高確認フィルター（エントリーシグナル時点）
 VOLUME_FILTER_MULTIPLIER: float = 1.35   # 当日出来高 ≥ N日平均 × 1.35
@@ -256,10 +457,37 @@ VOLUME_FILTER_PERIOD: int = 20           # 平均算出期間（営業日）
 WARMUP_DAYS = 200
 
 # 同時保有ポジション上限（ドローダウン抑制）
-MAX_CONCURRENT_POSITIONS = 10
+# 【案12: りおぽん「10-15銘柄分散」→ 12に拡大】
+MAX_CONCURRENT_POSITIONS = 12
 
 # 市場環境フィルター: SPY 200日MA を下回ったら BUY シグナルを停止
 MARKET_FILTER_MA_PERIOD = 200
+
+# 【案1: ディップ買いフィルター】
+# りおぽん: 「好調な上昇相場では買わない。ディップの日に仕込む」
+# 直近N日高値からの下落率が DIP_MIN_PCT〜DIP_MAX_PCT の範囲のみエントリー許可
+DIP_FILTER_ENABLED: bool = True
+DIP_LOOKBACK: int = 20          # 高値計算のルックバック（営業日）
+DIP_MIN_PCT: float = 0.03       # 最低3%下落（高値近辺はスキップ）
+DIP_MAX_PCT: float = 0.20       # 最大20%下落（急落すぎはスキップ）
+
+# 【案7: 市場過熱フィルター】
+# りおぽん: 「好調な上昇相場では買わない」
+# SPY直近5日リターンがこの閾値超なら過熱市場 → エントリー回避
+SPY_HOT_5D_THRESHOLD: float = 0.05   # SPY 5日リターン > 5% は過熱
+
+# 【案9: 過熱回避フィルター】
+# りおぽん: 「急上昇中の銘柄にも触らない」
+# ユーザー懸念対応: 案1(ディップ)との競合を避けるため5日リターンで判定
+OVERBOUGHT_5D_THRESHOLD: float = 0.10   # 5日で10%超上昇はスキップ
+
+# 【案10: 決算後ディップ優先エントリー】
+# りおぽん: 「決算で売られたが内容は悪くない銘柄は良い押し目」
+# ユーザー懸念対応: 出来高急増 + 反発陽線を必須条件として「落ちるナイフ」誤買いを防止
+POST_EARNINGS_WINDOW_DAYS: int = 21    # 決算後21カレンダー日以内
+POST_EARNINGS_MIN_DROP: float = -0.08 # 最低8%の決算後下落が必要
+POST_EARNINGS_SCORE_BONUS: float = 0.05  # スコアボーナス
+POST_EARNINGS_VOL_MULT: float = 1.50   # 出来高1.5倍以上（機関の押し目買い確認）必要
 
 
 # ============================================================
@@ -280,11 +508,13 @@ class TradeResult:
     pl_pct: float           # 損益率 (-1.0 〜 +∞)
     sl_price: float
     tp_price: float
+    score: float = 0.0      # シグナル発生時のスコア (0.65〜1.0)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ticker": self.ticker,
             "signal": self.signal,
+            "score": round(self.score, 4),
             "signal_date": self.signal_date,
             "entry_date": self.entry_date,
             "entry_price": round(self.entry_price, 4),
@@ -359,6 +589,200 @@ def _build_market_filter(spy_df: pd.DataFrame | None) -> dict[str, bool]:
     return result
 
 
+def _build_spy_hot_filter(spy_df: pd.DataFrame | None) -> dict[str, bool]:
+    """【案7】SPY 5日リターンが過熱かどうかを事前計算する。
+
+    りおぽん: 「好調な上昇相場では買わない」
+    SPY が直近5日で SPY_HOT_5D_THRESHOLD(5%) 超上昇した日は過熱市場と判定。
+
+    Returns:
+        日付文字列 → True(エントリーOK) / False(過熱=回避) の辞書。
+        SPY データがない場合は空辞書（= フィルターなし）。
+    """
+    if spy_df is None or spy_df.empty:
+        return {}
+
+    close = spy_df["Close"].astype(float)
+    result: dict[str, bool] = {}
+    for i in range(len(spy_df)):
+        date_str = spy_df.index[i].strftime("%Y-%m-%d")
+        if i < 5:
+            result[date_str] = True  # データ不足は許可
+        else:
+            spy_5d_ret = (close.iloc[i] - close.iloc[i - 5]) / close.iloc[i - 5]
+            result[date_str] = spy_5d_ret <= SPY_HOT_5D_THRESHOLD
+    return result
+
+
+def _build_sector_momentum(
+    tickers: list[str],
+    price_data: dict[str, "pd.DataFrame"],
+    fund_data: dict[str, dict],
+) -> dict[str, dict[str, float]]:
+    """【案4】セクター別モメンタムスコアを月次で事前計算する。
+
+    りおぽん: 「勝ち馬セクターに乗る」
+    各月末時点でセクター別の直近3ヶ月中央値リターンを計算し、
+    クロスセクター比較でスコア化。好調セクターの銘柄にボーナスを付与。
+
+    Returns:
+        {YYYY-MM: {sector: float}} のネストした辞書。
+        float は ±0.05 の範囲に正規化されたセクターボーナス。
+    """
+    from config.universe import get_sector
+
+    # セクター別の月次3ヶ月リターンを収集
+    sector_monthly_rets: dict[str, dict[str, list[float]]] = {}  # {YYYY-MM: {sector: [rets]}}
+
+    for ticker in tickers:
+        df = price_data.get(ticker)
+        if df is None or df.empty or len(df) < 64:
+            continue
+        sector = get_sector(ticker)
+        if not sector:
+            continue
+
+        close = df["Close"].astype(float)
+        # 月末のみ計算（リサンプリング）— resampleはDataFrameインデックスがDatetimeIndexである必要がある
+        try:
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df = df.copy()
+                df.index = pd.to_datetime(df.index)
+            monthly_ends = df.resample("ME").last().index
+            if len(monthly_ends) == 0:
+                # フォールバック: 月次サンプリング（古いpandasのME対応）
+                monthly_ends = df.resample("M").last().index
+        except Exception:
+            continue
+
+        for month_end in monthly_ends:
+            window = close.loc[:month_end]
+            if len(window) < 64:
+                continue
+            ret_3m = float(window.iloc[-1] - window.iloc[-64]) / float(window.iloc[-64]) if float(window.iloc[-64]) > 0 else 0.0
+            month_str = month_end.strftime("%Y-%m")
+            if month_str not in sector_monthly_rets:
+                sector_monthly_rets[month_str] = {}
+            if sector not in sector_monthly_rets[month_str]:
+                sector_monthly_rets[month_str][sector] = []
+            sector_monthly_rets[month_str][sector].append(ret_3m)
+
+    # セクター別中央値を計算し正規化
+    sector_scores: dict[str, dict[str, float]] = {}
+    for month_str, sector_rets in sector_monthly_rets.items():
+        sector_medians = {s: float(np.median(rets)) for s, rets in sector_rets.items() if len(rets) >= 3}
+        if len(sector_medians) < 2:
+            continue
+        all_med = float(np.median(list(sector_medians.values())))
+        all_std = float(np.std(list(sector_medians.values()))) or 0.01
+        scores = {}
+        for sector, med in sector_medians.items():
+            z = (med - all_med) / all_std
+            # 最大±0.05のボーナス（メインスコアへの影響を控えめに）
+            scores[sector] = float(np.clip(z * 0.02, -0.05, 0.05))
+        sector_scores[month_str] = scores
+
+    logger.info("セクターモメンタム事前計算完了: %d ヶ月分", len(sector_scores))
+    return sector_scores
+
+
+def _build_rolling_universe(
+    tickers: list[str],
+    price_data: dict[str, pd.DataFrame],
+    top_n: int = 100,
+    min_history_days: int = 200,
+) -> dict[str, set[str]]:
+    """ルックアヘッドバイアスなしで毎月の有効ユニバースを構築する。
+
+    各月 M のユニバース = 前月末時点のモメンタムスコア上位 top_n 銘柄。
+    例: 2019年2月のシグナルには「2019年1月31日までのデータ」で算出したスコアを使用。
+
+    Args:
+        tickers:          Tier1 通過済みティッカーリスト。
+        price_data:       ティッカー → OHLCV DataFrame（全期間データ）。
+        top_n:            各月で選択するティッカー数上限（デフォルト100）。
+        min_history_days: スコア計算に必要な最低データ日数（デフォルト200）。
+
+    Returns:
+        "YYYY-MM" → その月に有効なティッカー set のマッピング。
+        キーが存在しない月はフィルタ対象外（全銘柄許可）。
+    """
+    from analysis.momentum import calc_momentum_score
+
+    # 月末日カレンダーを取得（最初に見つかった有効な株価データから）
+    sample_df: pd.DataFrame | None = None
+    for ticker in tickers:
+        df = price_data.get(ticker)
+        if df is not None and not df.empty and isinstance(df.index, pd.DatetimeIndex):
+            sample_df = df
+            break
+
+    if sample_df is None:
+        logger.warning("ローリングユニバース: 有効な株価データがありません")
+        return {}
+
+    try:
+        monthly_ends = sample_df.resample("ME").last().index.tolist()
+    except Exception:
+        try:
+            monthly_ends = sample_df.resample("M").last().index.tolist()
+        except Exception:
+            logger.warning("ローリングユニバース: 月次リサンプリングに失敗")
+            return {}
+
+    if not monthly_ends:
+        return {}
+
+    logger.info(
+        "ローリングユニバース構築開始: %d ヶ月分 × %d 銘柄",
+        len(monthly_ends), len(tickers),
+    )
+
+    rolling_universe: dict[str, set[str]] = {}
+
+    for i, month_end in enumerate(monthly_ends):
+        # 各銘柄のモメンタムスコアを「月末時点まで」のデータで計算
+        scored: list[tuple[str, float]] = []
+        for ticker in tickers:
+            df = price_data.get(ticker)
+            if df is None or df.empty:
+                continue
+            if not isinstance(df.index, pd.DatetimeIndex):
+                continue
+            # 月末時点以前のデータに切り取り（ルックアヘッドバイアス防止）
+            df_window = df.loc[df.index <= month_end]
+            if len(df_window) < min_history_days:
+                continue
+            try:
+                score = calc_momentum_score(df_window)
+                scored.append((ticker, score))
+            except Exception:
+                continue
+
+        # スコア降順でトップ N を選択
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_tickers = {t for t, _ in scored[:top_n]}
+
+        # このユニバースを「翌月」のシグナルに適用
+        # （月末時点のデータ → 翌月初時点で利用可能 → 翌月のシグナルに使用）
+        if i + 1 < len(monthly_ends):
+            next_month_str = monthly_ends[i + 1].strftime("%Y-%m")
+            rolling_universe[next_month_str] = top_tickers
+
+        if (i + 1) % 12 == 0 or (i + 1) == len(monthly_ends):
+            logger.info(
+                "ローリングユニバース: %s 完了 (%d/%d ヶ月, 今月有効 %d 銘柄)",
+                month_end.strftime("%Y-%m"), i + 1, len(monthly_ends), len(top_tickers),
+            )
+
+    logger.info(
+        "ローリングユニバース構築完了: %d ヶ月分, 平均 %.1f 銘柄/月",
+        len(rolling_universe),
+        sum(len(v) for v in rolling_universe.values()) / max(1, len(rolling_universe)),
+    )
+    return rolling_universe
+
+
 def run_signal_backtest(
     tickers: list[str],
     price_data: dict[str, pd.DataFrame],
@@ -396,6 +820,27 @@ def run_signal_backtest(
     else:
         logger.info("市場環境フィルター: SPYデータなし → フィルター無効")
 
+    # ---- 【案7】市場過熱フィルター事前計算 ----
+    spy_not_hot = _build_spy_hot_filter(spy_df)
+    if spy_not_hot:
+        hot_days = sum(1 for v in spy_not_hot.values() if not v)
+        logger.info("市場過熱フィルター(案7): %d日中 %d日が過熱判定（エントリー回避）",
+                     len(spy_not_hot), hot_days)
+
+    # ---- 【案4】セクターモメンタム事前計算 ----
+    sector_momentum = _build_sector_momentum(tickers, price_data, fund_data)
+
+    # ---- ローリングユニバース構築（ルックアヘッドバイアス防止） ----
+    # 各月末のモメンタムスコアで翌月の有効銘柄セットを決定する。
+    # 例: 2019年1月末のスコア上位100 → 2019年2月のシグナルのみ有効
+    from config.screening import SCREENING_PARAMS as _sp
+    rolling_universe = _build_rolling_universe(
+        tickers, price_data,
+        top_n=_sp.max_screen_candidates,
+        min_history_days=WARMUP_DAYS,
+    )
+    logger.info("ローリングユニバース: %d ヶ月分を構築完了", len(rolling_universe))
+
     # ---- SL パラメータ ----
     # ATRベースの動的SL（-8%ハードストップをフロアとして適用）
     sl_multiplier = ATR_PARAMS.stop_loss_multiplier  # 2.0
@@ -424,11 +869,15 @@ def run_signal_backtest(
         fundamentals = fund_data.get(ticker)
         tasks.append((ticker, df, sector, fundamentals))
 
-    n_workers = max(1, min((mp.cpu_count() or 4) - 1, 8))
+    # ワーカー数: 論理コア数 - 1（メインプロセス用に1残す）、最低1・最大制限なし
+    cpu_count = mp.cpu_count() or 4
+    n_workers = max(1, cpu_count - 1)
     total_tasks = len(tasks)
-    logger.info("Phase1: %d 銘柄を %d ワーカーで並列処理開始", total_tasks, n_workers)
+    logger.info("Phase1: %d 銘柄を %d ワーカーで並列処理開始 (CPU=%d)",
+                total_tasks, n_workers, cpu_count)
 
-    chunksize = max(1, total_tasks // (n_workers * 4))
+    # chunksize を大きめに設定してプロセス間通信オーバーヘッドを削減
+    chunksize = max(1, total_tasks // (n_workers * 2))
     completed = 0
 
     if quarterly_data:
@@ -439,7 +888,8 @@ def run_signal_backtest(
     with mp.Pool(
         processes=n_workers,
         initializer=_init_phase1_worker,
-        initargs=(spy_df, market_ok, WARMUP_DAYS, earnings_dates or {}, quarterly_data or {}),
+        initargs=(spy_df, market_ok, WARMUP_DAYS, earnings_dates or {},
+                  quarterly_data or {}, spy_not_hot, sector_momentum),
     ) as pool:
         for ticker_candidates in pool.imap_unordered(
             _score_ticker_phase1, tasks, chunksize=chunksize,
@@ -454,18 +904,26 @@ def run_signal_backtest(
                 c["df"] = price_data[c["ticker"]]
                 signal_candidates.append(c)
 
-    logger.info("シグナル候補: %d 件を収集", len(signal_candidates))
+    logger.info("シグナル候補: %d 件を収集 (ローリングユニバースフィルタ前)", len(signal_candidates))
 
-    # Phase 2: 日付順にソートし、同時ポジション制約付きでトレード実行
+    # ---- ローリングユニバースフィルタ ----
+    # 各シグナル候補の発生月に対応するユニバース（前月末時点のトップN）に含まれる銘柄のみ残す。
+    # ユニバースが存在しない月（バックテスト開始直後の1ヶ月など）はフィルタを適用しない。
+    if rolling_universe:
+        before_filter = len(signal_candidates)
+        signal_candidates = [
+            c for c in signal_candidates
+            if c["ticker"] in rolling_universe.get(c["date"][:7], {c["ticker"]})
+        ]
+        logger.info(
+            "ローリングユニバースフィルタ後: %d → %d 件 (除外 %d 件)",
+            before_filter, len(signal_candidates), before_filter - len(signal_candidates),
+        )
+
+    # Phase 2: 日付順にソート後、ポートフォリオシミュレーション実行
     signal_candidates.sort(key=lambda c: (c["date"], -c["score"]))
 
-    # アクティブポジション管理: ticker → TradeResult (仮)
-    active_positions: dict[str, dict] = {}  # ticker → {entry, sl, tp, trade_result, df, df_idx}
-
-    # 日付ごとにグループ化して処理
-    from itertools import groupby
-
-    # 全日付を網羅するために、全銘柄の全日付を統合
+    # 全日付を統合
     all_dates: set[str] = set()
     for ticker in tickers:
         df = price_data.get(ticker)
@@ -474,12 +932,210 @@ def run_signal_backtest(
                 all_dates.add(dt.strftime("%Y-%m-%d"))
     sorted_dates = sorted(all_dates)
 
-    # シグナル候補を日付でインデックス化
+    all_trades = _run_phase2(
+        signal_candidates=signal_candidates,
+        sorted_dates=sorted_dates,
+        earnings_dates=earnings_dates,
+        sl_multiplier=sl_multiplier,
+        hard_stop_pct=hard_stop_pct,
+        sb_trail_mult=None,  # SB_TRAILING_ATR_MULT をデフォルト使用
+    )
+
+    logger.info("シグナルバックテスト完了: 合計 %d トレード", len(all_trades))
+    return _aggregate_signal_results(all_trades)
+
+
+def run_signal_backtest_multi_trail(
+    tickers: list[str],
+    price_data: dict[str, pd.DataFrame],
+    fund_data: dict[str, dict[str, Any]],
+    spy_df: pd.DataFrame | None = None,
+    earnings_dates: dict[str, list[str]] | None = None,
+    quarterly_data: dict[str, dict] | None = None,
+    sb_trail_mults: list[float] | None = None,
+) -> dict[float, "SignalBacktestResult"]:
+    """Phase1を1回実行し、sb_trail_mults の各値でPhase2を実行して比較する。
+
+    複数のトレーリング幅を比較する際に Phase1（最も時間がかかる部分）を
+    使い回せるため、run_signal_backtest を N 回呼ぶより大幅に高速。
+
+    Args:
+        sb_trail_mults: 比較するSTRONG_BUYトレーリング倍率リスト。
+                        デフォルト: [4.0, 4.5]
+
+    Returns:
+        {trail_mult: SignalBacktestResult} の辞書。
+    """
+    if sb_trail_mults is None:
+        sb_trail_mults = [4.0, 4.5]
+
+    from config.universe import get_sector
+    from config.settings import ATR_PARAMS, TRADE_RULES
+
+    # ---- 市場環境フィルター事前計算 ----
+    market_ok = _build_market_filter(spy_df)
+    if market_ok:
+        bearish_days = sum(1 for v in market_ok.values() if not v)
+        logger.info("市場環境フィルター: %d日中 %d日がベア判定（BUY禁止）",
+                     len(market_ok), bearish_days)
+    else:
+        logger.info("市場環境フィルター: SPYデータなし → フィルター無効")
+
+    # ---- 【案7】市場過熱フィルター事前計算 ----
+    spy_not_hot = _build_spy_hot_filter(spy_df)
+    if spy_not_hot:
+        hot_days = sum(1 for v in spy_not_hot.values() if not v)
+        logger.info("市場過熱フィルター(案7): %d日中 %d日が過熱判定（エントリー回避）",
+                     len(spy_not_hot), hot_days)
+
+    # ---- 【案4】セクターモメンタム事前計算 ----
+    sector_momentum = _build_sector_momentum(tickers, price_data, fund_data)
+
+    # ---- ローリングユニバース構築（ルックアヘッドバイアス防止） ----
+    from config.screening import SCREENING_PARAMS as _sp
+    rolling_universe = _build_rolling_universe(
+        tickers, price_data,
+        top_n=_sp.max_screen_candidates,
+        min_history_days=WARMUP_DAYS,
+    )
+    logger.info("ローリングユニバース: %d ヶ月分を構築完了", len(rolling_universe))
+
+    # ---- SL パラメータ ----
+    sl_multiplier = ATR_PARAMS.stop_loss_multiplier
+    hard_stop_pct = TRADE_RULES.hard_stop_loss_pct
+
+    # ---- Phase 1: 銘柄ごとにシグナル候補を並列スコアリング（キャッシュ対応） ----
+    signal_candidates: list[dict] = []
+
+    tasks = []
+    for ticker in tickers:
+        df = price_data.get(ticker)
+        if df is None or df.empty:
+            continue
+        if len(df) < WARMUP_DAYS + 5:
+            continue
+        sector = get_sector(ticker)
+        fundamentals = fund_data.get(ticker)
+        tasks.append((ticker, df, sector, fundamentals))
+
+    # キャッシュチェック
+    cache_key = _compute_phase1_cache_key(tickers, bool(quarterly_data))
+    cached_candidates = _load_phase1_cache(cache_key)
+
+    if cached_candidates is not None:
+        # キャッシュヒット: df を price_data から再アタッチして即利用
+        for c in cached_candidates:
+            df = price_data.get(c["ticker"])
+            if df is not None:
+                c["df"] = df
+                signal_candidates.append(c)
+        logger.info("Phase1スキップ（キャッシュ利用）: %d 件", len(signal_candidates))
+    else:
+        # キャッシュなし: 通常の並列スコアリングを実行
+        cpu_count = mp.cpu_count() or 4
+        n_workers = max(1, cpu_count - 1)
+        total_tasks = len(tasks)
+        logger.info("Phase1 (multi-trail): %d 銘柄を %d ワーカーで並列処理開始 (CPU=%d)",
+                    total_tasks, n_workers, cpu_count)
+
+        chunksize = max(1, total_tasks // (n_workers * 2))
+        completed = 0
+
+        if quarterly_data:
+            logger.info("四半期財務データ: %d 銘柄分 (M=65%%, Q=35%%)", len(quarterly_data))
+        else:
+            logger.info("四半期財務データなし → Momentum=100%% フォールバック")
+
+        with mp.Pool(
+            processes=n_workers,
+            initializer=_init_phase1_worker,
+            initargs=(spy_df, market_ok, WARMUP_DAYS, earnings_dates or {},
+                      quarterly_data or {}, spy_not_hot, sector_momentum),
+        ) as pool:
+            for ticker_candidates in pool.imap_unordered(
+                _score_ticker_phase1, tasks, chunksize=chunksize,
+            ):
+                completed += 1
+                if completed % 50 == 0 or completed == total_tasks:
+                    logger.info(
+                        "Phase1 進捗: %d / %d 銘柄 (%d%%)",
+                        completed, total_tasks, int(completed / total_tasks * 100),
+                    )
+                for c in ticker_candidates:
+                    c["df"] = price_data[c["ticker"]]
+                    signal_candidates.append(c)
+
+        # キャッシュ保存（df は除外）
+        _save_phase1_cache(cache_key, signal_candidates)
+
+    logger.info("シグナル候補: %d 件を収集 (ローリングユニバースフィルタ前)", len(signal_candidates))
+
+    # ---- ローリングユニバースフィルタ ----
+    if rolling_universe:
+        before_filter = len(signal_candidates)
+        signal_candidates = [
+            c for c in signal_candidates
+            if c["ticker"] in rolling_universe.get(c["date"][:7], {c["ticker"]})
+        ]
+        logger.info(
+            "ローリングユニバースフィルタ後: %d → %d 件 (除外 %d 件)",
+            before_filter, len(signal_candidates), before_filter - len(signal_candidates),
+        )
+
+    # Phase2 用の準備
+    signal_candidates.sort(key=lambda c: (c["date"], -c["score"]))
+
+    all_dates: set[str] = set()
+    for ticker in tickers:
+        df = price_data.get(ticker)
+        if df is not None and not df.empty:
+            for dt in df.index:
+                all_dates.add(dt.strftime("%Y-%m-%d"))
+    sorted_dates = sorted(all_dates)
+
+    # ---- Phase 2: 各トレーリング幅でシミュレーション（Phase1の結果を使い回す） ----
+    results: dict[float, SignalBacktestResult] = {}
+    for mult in sb_trail_mults:
+        logger.info("Phase2 実行中: sb_trail_mult=%.1f", mult)
+        trades = _run_phase2(
+            signal_candidates=signal_candidates,
+            sorted_dates=sorted_dates,
+            earnings_dates=earnings_dates,
+            sl_multiplier=sl_multiplier,
+            hard_stop_pct=hard_stop_pct,
+            sb_trail_mult=mult,
+        )
+        results[mult] = _aggregate_signal_results(trades)
+        logger.info(
+            "sb_trail_mult=%.1f 完了: %d トレード, 勝率 %.1f%%, 平均 %+.2f%%",
+            mult, len(trades),
+            results[mult].win_rate * 100,
+            results[mult].avg_pl_pct * 100,
+        )
+
+    return results
+
+
+def _run_phase2(
+    signal_candidates: list[dict],
+    sorted_dates: list[str],
+    earnings_dates: dict[str, list[str]] | None,
+    sl_multiplier: float,
+    hard_stop_pct: float,
+    sb_trail_mult: float | None = None,
+) -> list[TradeResult]:
+    """Phase2: シグナル候補を日付順にポートフォリオシミュレーション。
+
+    sb_trail_mult を指定することで STRONG_BUY のトレーリング幅を上書きできる。
+    Phase1 の結果（signal_candidates）を使い回して複数パラメータを比較可能。
+    """
+    all_trades: list[TradeResult] = []
+    active_positions: dict[str, dict] = {}
+
     candidates_by_date: dict[str, list[dict]] = {}
     for c in signal_candidates:
         candidates_by_date.setdefault(c["date"], []).append(c)
 
-    # 銘柄ごとに「最後に決済した日付」を記録（同一銘柄の重複エントリー防止）
     last_exit_date: dict[str, str] = {}
 
     for date_str in sorted_dates:
@@ -487,7 +1143,6 @@ def run_signal_backtest(
         closed_tickers = []
         for ticker, pos in list(active_positions.items()):
             df = pos["df"]
-            # この日の行を取得
             if date_str not in [d.strftime("%Y-%m-%d") for d in df.index]:
                 continue
             date_idx = None
@@ -500,7 +1155,7 @@ def run_signal_backtest(
 
             row = df.iloc[date_idx]
 
-            # 決算前 3営業日（≈ 5カレンダー日）強制決済チェック
+            # 決算前強制決済チェック
             trade = None
             if earnings_dates:
                 ticker_earnings = earnings_dates.get(ticker, [])
@@ -510,7 +1165,7 @@ def run_signal_backtest(
                         days_to_e = (
                             pd.Timestamp(ticker_earnings[ei]) - pd.Timestamp(date_str)
                         ).days
-                        if 0 < days_to_e <= 5:  # 5カレンダー日以内（≈ 3営業日）
+                        if 0 < days_to_e <= 5:
                             close_price = float(row["Close"])
                             tr = pos["trade_result"]
                             pl_pct = (close_price - tr.entry_price) / tr.entry_price
@@ -520,16 +1175,16 @@ def run_signal_backtest(
                                 entry_price=tr.entry_price, exit_date=date_str,
                                 exit_price=close_price, result="pre_earnings",
                                 pl_pct=pl_pct,
-                                sl_price=tr.sl_price, tp_price=0.0,
+                                sl_price=tr.sl_price, tp_price=0.0, score=tr.score,
                             )
 
-            # 通常の決済判定（SL / トレーリングストップ / タイムアウト）
             if trade is None:
                 trade, new_hh = _check_exit(
                     pos["trade_result"], date_str, row,
                     atr=pos["atr"], highest_high=pos["highest_high"],
+                    sb_trail_mult=sb_trail_mult,
                 )
-                pos["highest_high"] = new_hh  # 最高値を更新
+                pos["highest_high"] = new_hh
 
             if trade is not None:
                 all_trades.append(trade)
@@ -539,42 +1194,30 @@ def run_signal_backtest(
         for t in closed_tickers:
             del active_positions[t]
 
-        # Step 2: 新規エントリー（スコア降順、同時上限まで）
+        # Step 2: 新規エントリー
         day_candidates = candidates_by_date.get(date_str, [])
         for c in day_candidates:
-            # 同時ポジション上限チェック
             if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
                 break
-
             ticker = c["ticker"]
-
-            # 既にポジション保有中ならスキップ
             if ticker in active_positions:
                 continue
-
-            # 直前に決済した銘柄はこの日は再エントリーしない
             if last_exit_date.get(ticker) == date_str:
                 continue
 
             entry_price = c["entry_price"]
             atr = c["atr"]
-
-            # ATRベースの動的SL（-8%ハードストップをフロアとして適用）
-            # risk.py と同様: max(ATRベースSL, -8%ハードSL) = 損失が小さい方を採用
             atr_sl   = entry_price - atr * sl_multiplier
-            hard_sl  = entry_price * (1.0 + hard_stop_pct)   # -8%
+            hard_sl  = entry_price * (1.0 + hard_stop_pct)
             sl_price = max(atr_sl, hard_sl)
-
-            # SL が 0以下にならないように最低保証
             if sl_price <= 0:
-                sl_price = entry_price * 0.90  # フォールバック: -10%
+                sl_price = entry_price * 0.90
 
             df = c["df"]
             df_idx = c["df_idx"]
-
-            # 将来データ（エントリー日の翌日から最大 MAX_HOLD_DAYS）
+            _hold_limit = SB_MAX_HOLD_DAYS if c["signal"] == "STRONG_BUY" else MAX_HOLD_DAYS
             future_start = df_idx + 2
-            future_end = min(df_idx + 2 + MAX_HOLD_DAYS, len(df))
+            future_end = min(df_idx + 2 + _hold_limit, len(df))
             future_df = df.iloc[future_start:future_end]
 
             trade = _simulate_trade(
@@ -586,6 +1229,8 @@ def run_signal_backtest(
                 sl_price=sl_price,
                 atr=atr,
                 future_df=future_df,
+                score=c.get("score", 0.0),
+                sb_trail_mult=sb_trail_mult,
             )
 
             active_positions[ticker] = {
@@ -595,7 +1240,7 @@ def run_signal_backtest(
                 "highest_high": entry_price,
             }
 
-    # 期間終了時に残っているポジションを強制決済
+    # 期間終了時の残ポジションを強制決済
     for ticker, pos in active_positions.items():
         tr = pos["trade_result"]
         df = pos["df"]
@@ -603,32 +1248,31 @@ def run_signal_backtest(
         last_date = df.index[-1].strftime("%Y-%m-%d")
         pl_pct = (float(last_row["Close"]) - tr.entry_price) / tr.entry_price
         all_trades.append(TradeResult(
-            ticker=tr.ticker,
-            signal=tr.signal,
-            signal_date=tr.signal_date,
-            entry_date=tr.entry_date,
-            entry_price=tr.entry_price,
-            exit_date=last_date,
-            exit_price=float(last_row["Close"]),
-            result="timeout",
-            pl_pct=pl_pct,
-            sl_price=tr.sl_price,
-            tp_price=tr.tp_price,
+            ticker=tr.ticker, signal=tr.signal,
+            signal_date=tr.signal_date, entry_date=tr.entry_date,
+            entry_price=tr.entry_price, exit_date=last_date,
+            exit_price=float(last_row["Close"]), result="timeout",
+            pl_pct=pl_pct, sl_price=tr.sl_price, tp_price=tr.tp_price, score=tr.score,
         ))
 
-    logger.info("シグナルバックテスト完了: 合計 %d トレード", len(all_trades))
-    return _aggregate_signal_results(all_trades)
+    return all_trades
 
 
 def _get_trail_level(
     highest_high: float,
     entry_price: float,
     atr: float,
+    trail_mult_override: float | None = None,
 ) -> float:
     """段階的トレーリングストップの水準を返す。
 
     含み益（ATR倍率）に応じてトレール倍率を縮小し、利益をロックする。
     BREAKEVEN_TRIGGER_ATR 以上の含み益では SL ≥ エントリー価格を保証（床）。
+
+    【案6: 直近高値ベーストレーリング追加】
+    りおぽん: 「直近高値から5%以上下落したら利確検討」
+    ユーザー懸念対応: ATR考慮で可変化 → max(5%, ATR×1.5÷高値) のルームを確保
+    ATRトレーリングと直近高値%トレーリングの高い方（より保守的な方）を採用。
 
     Args:
         highest_high: 保有中の最高値。
@@ -638,23 +1282,42 @@ def _get_trail_level(
     Returns:
         トレーリングストップ価格。
     """
+    # trail_mult_override が指定されている場合（STRONG_BUY 専用）はそれを基準倍率とする
+    base_mult = trail_mult_override if trail_mult_override is not None else TRAILING_STOP_ATR_MULTIPLIER
+
     if atr <= 0:
-        return highest_high - atr * TRAILING_STOP_ATR_MULTIPLIER
+        return highest_high - atr * base_mult
 
     peak_profit_atr = (highest_high - entry_price) / atr
 
     # 段階的倍率: 含み益大きいほどタイトに
-    trail_mult = TRAILING_STOP_ATR_MULTIPLIER
-    for min_atr, mult in PROGRESSIVE_TRAIL_LEVELS:
-        if peak_profit_atr >= min_atr:
-            trail_mult = mult
-            break
+    # ただし trail_mult_override が指定された場合（STRONG_BUY）は PROGRESSIVE_TRAIL_LEVELS を
+    # バイパスして固定倍率を維持する。これにより trail×4.0 vs trail×4.5 の比較が有効になる。
+    # BUY (override=None): 通常の段階的トレーリング（3.5→3.0→2.5→2.0）
+    # STRONG_BUY (override=4.0/4.5): 固定幅トレーリング（利益確保よりも大きな上昇を待つ）
+    trail_mult = base_mult
+    if trail_mult_override is None:
+        for min_atr, mult in PROGRESSIVE_TRAIL_LEVELS:
+            if peak_profit_atr >= min_atr:
+                trail_mult = mult
+                break
 
-    trail = highest_high - atr * trail_mult
+    trail_atr = highest_high - atr * trail_mult
 
-    # ブレイクイーブン床: 含み益 ≥ BREAKEVEN_TRIGGER_ATR → SL はエントリー価格以上
+    # 【案6】直近高値ベーストレーリング（ボラ考慮の可変版）
+    # ルーム = max(5%, ATR×1.5÷高値) → 高ボラ株は広め、安定株は5%
+    if highest_high > 0:
+        pct_room = max(PEAK_TRAIL_MIN_PCT, PEAK_TRAIL_ATR_MULT * atr / highest_high)
+        trail_peak = highest_high * (1.0 - pct_room)
+    else:
+        trail_peak = trail_atr
+
+    # 2つのトレーリングの高い方（より早く発動する方）を採用
+    trail = max(trail_atr, trail_peak)
+
+    # ブレイクイーブン床: 含み益 ≥ BREAKEVEN_TRIGGER_ATR → SL はエントリー価格 + ATR×ラチェット以上
     if peak_profit_atr >= BREAKEVEN_TRIGGER_ATR:
-        trail = max(trail, entry_price)
+        trail = max(trail, entry_price + atr * BREAKEVEN_LOCK_ATR)
 
     return trail
 
@@ -668,6 +1331,8 @@ def _simulate_trade(
     sl_price: float,
     atr: float,
     future_df: pd.DataFrame,
+    score: float = 0.0,
+    sb_trail_mult: float | None = None,
 ) -> TradeResult:
     """SL + トレーリングストップ + 段階的タイムアウトでトレードを模擬する。
 
@@ -685,6 +1350,14 @@ def _simulate_trade(
         TradeResult（ポジションとして仮保存した状態）。
     """
     highest_high = entry_price  # エントリー価格を初期値
+
+    # STRONG_BUY 専用パラメータの適用
+    # sb_trail_mult が引数で渡された場合はそれを優先（複数パターン比較用）
+    is_strong_buy = (signal == "STRONG_BUY")
+    _sb_tm        = sb_trail_mult if sb_trail_mult is not None else SB_TRAILING_ATR_MULT
+    _trail_mult   = _sb_tm if is_strong_buy else TRAILING_STOP_ATR_MULTIPLIER
+    _max_hold     = SB_MAX_HOLD_DAYS if is_strong_buy else MAX_HOLD_DAYS
+    _use_timeout  = SB_STAGED_TIMEOUT_ENABLED if is_strong_buy else True
 
     for idx in range(len(future_df)):
         row = future_df.iloc[idx]
@@ -708,12 +1381,14 @@ def _simulate_trade(
                 exit_date=date_str, exit_price=exit_price_sl,
                 result="sl_hit",
                 pl_pct=(exit_price_sl - entry_price) / entry_price,
-                sl_price=sl_price, tp_price=0.0,
+                sl_price=sl_price, tp_price=0.0, score=score,
             )
 
-        # トレーリングストップ判定（段階的トレーリング + ブレイクイーブン床）
-        trail_level = _get_trail_level(highest_high, entry_price, atr)
-        if trail_level >= entry_price and close <= trail_level:
+        # トレーリングストップ判定（STRONG_BUY は広めの倍率を使用）
+        # 【案1】エントリーから5営業日間はトレーリングストップを停止（SLは通常通り有効）
+        trail_level = _get_trail_level(highest_high, entry_price, atr,
+                                       trail_mult_override=_trail_mult)
+        if holding_days > 5 and trail_level >= entry_price and close <= trail_level:
             pl_pct = (trail_level - entry_price) / entry_price
             return TradeResult(
                 ticker=ticker, signal=signal, signal_date=signal_date,
@@ -721,23 +1396,35 @@ def _simulate_trade(
                 exit_date=date_str, exit_price=trail_level,
                 result="trailing_stop",
                 pl_pct=pl_pct,
-                sl_price=sl_price, tp_price=0.0,
+                sl_price=sl_price, tp_price=0.0, score=score,
             )
 
-        # 段階的タイムアウト判定
-        pl_pct = (close - entry_price) / entry_price
-        for threshold_days, min_profit in STAGED_TIMEOUT:
-            if holding_days == threshold_days and pl_pct < min_profit:
-                return TradeResult(
-                    ticker=ticker, signal=signal, signal_date=signal_date,
-                    entry_date=entry_date, entry_price=entry_price,
-                    exit_date=date_str, exit_price=close,
-                    result=f"timeout_{threshold_days}d",
-                    pl_pct=pl_pct,
-                    sl_price=sl_price, tp_price=0.0,
-                )
+        # 段階的タイムアウト判定（STRONG_BUY は無効化）
+        if _use_timeout:
+            pl_pct = (close - entry_price) / entry_price
+            for threshold_days, min_profit in STAGED_TIMEOUT:
+                if holding_days == threshold_days and pl_pct < min_profit:
+                    return TradeResult(
+                        ticker=ticker, signal=signal, signal_date=signal_date,
+                        entry_date=entry_date, entry_price=entry_price,
+                        exit_date=date_str, exit_price=close,
+                        result=f"timeout_{threshold_days}d",
+                        pl_pct=pl_pct,
+                        sl_price=sl_price, tp_price=0.0, score=score,
+                    )
 
-    # 絶対タイムアウト（90営業日）: 最終日の終値で強制決済
+        # 絶対タイムアウト（STRONG_BUY は 90日、BUY は 60日）
+        if holding_days >= _max_hold:
+            return TradeResult(
+                ticker=ticker, signal=signal, signal_date=signal_date,
+                entry_date=entry_date, entry_price=entry_price,
+                exit_date=date_str, exit_price=close,
+                result=f"timeout_{_max_hold}d",
+                pl_pct=(close - entry_price) / entry_price,
+                sl_price=sl_price, tp_price=0.0, score=score,
+            )
+
+    # future_df が尽きた場合（期間末）
     if len(future_df) > 0:
         last_row = future_df.iloc[-1]
         last_date = future_df.index[-1].strftime("%Y-%m-%d")
@@ -750,9 +1437,9 @@ def _simulate_trade(
         ticker=ticker, signal=signal, signal_date=signal_date,
         entry_date=entry_date, entry_price=entry_price,
         exit_date=last_date, exit_price=last_close,
-        result="timeout_90d",
+        result=f"timeout_{_max_hold}d",
         pl_pct=(last_close - entry_price) / entry_price,
-        sl_price=sl_price, tp_price=0.0,
+        sl_price=sl_price, tp_price=0.0, score=score,
     )
 
 
@@ -762,6 +1449,7 @@ def _check_exit(
     row: pd.Series,
     atr: float,
     highest_high: float,
+    sb_trail_mult: float | None = None,
 ) -> tuple[TradeResult | None, float]:
     """保有中ポジションの決済判定（SL + トレーリングストップ + 段階的タイムアウト）。
 
@@ -781,6 +1469,13 @@ def _check_exit(
     if high > highest_high:
         highest_high = high
 
+    # STRONG_BUY 専用パラメータ（引数で渡された場合はそれを優先）
+    is_strong_buy = (position.signal == "STRONG_BUY")
+    _sb_tm        = sb_trail_mult if sb_trail_mult is not None else SB_TRAILING_ATR_MULT
+    _trail_mult   = _sb_tm if is_strong_buy else None
+    _max_hold     = SB_MAX_HOLD_DAYS if is_strong_buy else MAX_HOLD_DAYS
+    _use_timeout  = SB_STAGED_TIMEOUT_ENABLED if is_strong_buy else True
+
     # SL判定（ギャップダウン対応: 始値がSL以下なら始値で約定）
     if low <= position.sl_price or open_price <= position.sl_price:
         exit_price = min(position.sl_price, open_price)
@@ -790,11 +1485,12 @@ def _check_exit(
             signal_date=position.signal_date, entry_date=position.entry_date,
             entry_price=position.entry_price, exit_date=current_date_str,
             exit_price=exit_price, result="sl_hit", pl_pct=pl_pct,
-            sl_price=position.sl_price, tp_price=0.0,
+            sl_price=position.sl_price, tp_price=0.0, score=position.score,
         ), highest_high
 
-    # トレーリングストップ判定（段階的トレーリング + ブレイクイーブン床）
-    trail_level = _get_trail_level(highest_high, position.entry_price, atr)
+    # トレーリングストップ判定（STRONG_BUY は広めの倍率）
+    trail_level = _get_trail_level(highest_high, position.entry_price, atr,
+                                   trail_mult_override=_trail_mult)
     if trail_level >= position.entry_price and close <= trail_level:
         pl_pct = (trail_level - position.entry_price) / position.entry_price
         return TradeResult(
@@ -802,10 +1498,10 @@ def _check_exit(
             signal_date=position.signal_date, entry_date=position.entry_date,
             entry_price=position.entry_price, exit_date=current_date_str,
             exit_price=trail_level, result="trailing_stop", pl_pct=pl_pct,
-            sl_price=position.sl_price, tp_price=0.0,
+            sl_price=position.sl_price, tp_price=0.0, score=position.score,
         ), highest_high
 
-    # 段階的タイムアウト判定
+    # 段階的タイムアウト判定（STRONG_BUY は無効）
     try:
         entry_dt = pd.Timestamp(position.entry_date)
         current_dt = pd.Timestamp(current_date_str)
@@ -815,27 +1511,38 @@ def _check_exit(
 
         pl_pct = (close - position.entry_price) / position.entry_price
 
-        # 段階的タイムアウトチェック
-        for threshold_days, min_profit in STAGED_TIMEOUT:
-            if approx_biz_days >= threshold_days:
-                if pl_pct < min_profit:
-                    return TradeResult(
-                        ticker=position.ticker, signal=position.signal,
-                        signal_date=position.signal_date, entry_date=position.entry_date,
-                        entry_price=position.entry_price, exit_date=current_date_str,
-                        exit_price=close, result=f"timeout_{threshold_days}d",
-                        pl_pct=pl_pct,
-                        sl_price=position.sl_price, tp_price=0.0,
-                    ), highest_high
+        if _use_timeout:
+            for idx_t, (threshold_days, min_profit) in enumerate(STAGED_TIMEOUT):
+                is_last_threshold = (idx_t == len(STAGED_TIMEOUT) - 1)
+                if is_last_threshold:
+                    if approx_biz_days >= threshold_days and pl_pct < min_profit:
+                        return TradeResult(
+                            ticker=position.ticker, signal=position.signal,
+                            signal_date=position.signal_date, entry_date=position.entry_date,
+                            entry_price=position.entry_price, exit_date=current_date_str,
+                            exit_price=close, result=f"timeout_{threshold_days}d",
+                            pl_pct=pl_pct,
+                            sl_price=position.sl_price, tp_price=0.0, score=position.score,
+                        ), highest_high
+                else:
+                    if (threshold_days - 2) <= approx_biz_days <= (threshold_days + 2) and pl_pct < min_profit:
+                        return TradeResult(
+                            ticker=position.ticker, signal=position.signal,
+                            signal_date=position.signal_date, entry_date=position.entry_date,
+                            entry_price=position.entry_price, exit_date=current_date_str,
+                            exit_price=close, result=f"timeout_{threshold_days}d",
+                            pl_pct=pl_pct,
+                            sl_price=position.sl_price, tp_price=0.0, score=position.score,
+                        ), highest_high
 
-        # 絶対タイムアウト（90営業日 ≈ 126カレンダー日）
-        if approx_biz_days >= MAX_HOLD_DAYS:
+        # 絶対タイムアウト（STRONG_BUY: 90日, BUY: 60日）
+        if approx_biz_days >= _max_hold:
             return TradeResult(
                 ticker=position.ticker, signal=position.signal,
                 signal_date=position.signal_date, entry_date=position.entry_date,
                 entry_price=position.entry_price, exit_date=current_date_str,
-                exit_price=close, result="timeout_90d", pl_pct=pl_pct,
-                sl_price=position.sl_price, tp_price=0.0,
+                exit_price=close, result=f"timeout_{_max_hold}d", pl_pct=pl_pct,
+                sl_price=position.sl_price, tp_price=0.0, score=position.score,
             ), highest_high
     except Exception:
         pass

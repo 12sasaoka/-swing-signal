@@ -35,6 +35,7 @@ def fetch_prices(
     db: CacheDB | None = None,
     period: str | None = None,
     force_refresh: bool = False,
+    allow_stale: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """指定銘柄の日足 OHLCV データを取得する。
 
@@ -61,8 +62,8 @@ def fetch_prices(
     # period から cache_days を算出（長期 period 対応）
     _period_to_days = {
         "1d": 1, "5d": 5, "1mo": 30, "3mo": 90, "6mo": 180,
-        "1y": 365, "2y": 730, "3y": 1100, "5y": 1830,
-        "7y": 2556, "10y": 3650,
+        "1y": 365, "2y": 730, "3y": 1100, "4y": 1460, "5y": 1830,
+        "6y": 2190, "7y": 2556, "10y": 3650,
         "ytd": 365, "max": 5000,
     }
     cache_days = _period_to_days.get(period) if period else None
@@ -71,6 +72,11 @@ def fetch_prices(
     if force_refresh:
         stale_tickers = list(tickers)
         cached_results: dict[str, pd.DataFrame] = {}
+    elif allow_stale:
+        # バックテスト用: 鮮度チェックをスキップし、DBにデータがあればそのまま使用
+        cached_results, stale_tickers = _separate_cached(
+            tickers, db, cache_days=cache_days, allow_stale=True
+        )
     else:
         cached_results, stale_tickers = _separate_cached(tickers, db, cache_days=cache_days)
 
@@ -121,6 +127,7 @@ def _separate_cached(
     tickers: list[str],
     db: CacheDB,
     cache_days: int | None = None,
+    allow_stale: bool = False,
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
     """キャッシュが新鮮な銘柄をDBから読み込み、古い銘柄リストを返す。
 
@@ -129,7 +136,9 @@ def _separate_cached(
     - 週末・祝日をまたいでも不要な再取得を回避する
 
     Args:
-        cache_days: DBから読み込む日数。None の場合は price_history_days。
+        cache_days:   DBから読み込む日数。None の場合は price_history_days。
+        allow_stale:  True の場合、鮮度チェックをスキップしてDBにデータがあれば使用。
+                      バックテスト用途向け（最新データでなくても歴史データとして有効）。
 
     Returns:
         (キャッシュ済み結果の辞書, 再取得が必要なティッカーリスト)
@@ -150,8 +159,8 @@ def _separate_cached(
             stale.append(ticker)
             continue
 
-        # 最新データ日が直近の営業日より古ければ再取得
-        if latest_date.date() < latest_trading_day:
+        # 鮮度チェック: allow_stale=True の場合はスキップ（DBにデータがあれば使用）
+        if not allow_stale and latest_date.date() < latest_trading_day:
             stale.append(ticker)
             continue
 
@@ -243,7 +252,7 @@ def _fetch_and_store(
     max_workers = FETCHER_CONFIG.max_workers
 
     # 長期期間フェッチ（バックテスト用）はレート制限リスクが高いため逐次処理
-    _long_periods = {"2y", "3y", "5y", "10y", "ytd", "max"}
+    _long_periods = {"2y", "3y", "4y", "5y", "6y", "7y", "10y", "ytd", "max"}
     sequential = period in _long_periods
 
     if sequential:

@@ -71,7 +71,7 @@ def calc_value_score(
                 weights.append(w)
 
         if not scores:
-            logger.warning("バリュー計算: 算出可能な指標がゼロ")
+            logger.debug("バリュー計算: 算出可能な指標がゼロ")
             return 0.0
 
         # ウェイト再正規化

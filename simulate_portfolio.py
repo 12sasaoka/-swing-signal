@@ -25,11 +25,12 @@ if hasattr(sys.stdout, "reconfigure"):
 INITIAL_CAPITAL = 4000.0
 MAX_POSITIONS = 11
 RISK_PER_TRADE = 0.0070    # 1トレードあたり許容リスク = 総資産の0.70%
-MAX_ALLOC_PCT = 0.095       # 1トレード最大配分 = 総資産の9.5%
+MAX_ALLOC_PCT = 0.095       # 1トレード最大配分 = 総資産の9.5% (BUY)
+SB_MAX_ALLOC_PCT = 0.10     # STRONG_BUY 最大配分 = 総資産の10.0%
 MIN_RISK_RATIO = 0.005      # 最低リスク距離 = 0.5%（極端低ボラ対策）
 SIGNAL_FILTER = None            # None or list: e.g. ["STRONG_BUY"] or ["BUY"] or None(全件)
 
-CSV_PATH = r"C:\Users\mh121\OneDrive\Desktop\swing_signal\output\backtest\signal_backtest_20260222_122037.csv"
+CSV_PATH = r"C:\Users\mh121\OneDrive\Desktop\swing_signal\output\backtest\signal_backtest_20260303_013237_sb_trail4.5.csv"
 
 RESULT_LABELS = {
     "sl_hit":        "SL Hit",
@@ -172,8 +173,10 @@ def simulate(trades: list[Trade]) -> None:
             # 投資金額 = 許容リスク額 / リスク比率
             investment = risk_amount / risk_ratio
 
-            # キャップ: min(投資額, 総資産×15%, 残現金)
-            max_alloc = total_equity * MAX_ALLOC_PCT
+            # キャップ: min(投資額, 総資産×配分上限, 残現金)
+            # STRONG_BUY は 10%、BUY は 9.5%
+            _alloc_pct = SB_MAX_ALLOC_PCT if t.signal == "STRONG_BUY" else MAX_ALLOC_PCT
+            max_alloc = total_equity * _alloc_pct
             alloc = min(investment, max_alloc, cash)
 
             # 株数 = floor(alloc / entry_price) → 端数切り捨てで再計算

@@ -178,7 +178,7 @@ def check_exit(
 
     # 4) 絶対タイムアウト
     if pos.holding_days >= MAX_HOLD_DAYS:
-        return "timeout_90d", today_close
+        return f"timeout_{MAX_HOLD_DAYS}d", today_close
 
     return None, 0.0
 
