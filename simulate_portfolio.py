@@ -24,13 +24,13 @@ if hasattr(sys.stdout, "reconfigure"):
 
 INITIAL_CAPITAL = 4000.0
 MAX_POSITIONS = 11
-RISK_PER_TRADE = 0.0070    # 1トレードあたり許容リスク = 総資産の0.70%
-MAX_ALLOC_PCT = 0.095       # 1トレード最大配分 = 総資産の9.5% (BUY)
-SB_MAX_ALLOC_PCT = 0.10     # STRONG_BUY 最大配分 = 総資産の10.0%
+RISK_PER_TRADE = 0.0050    # 1トレードあたり許容リスク = 総資産の0.50%（WFT最適化）
+MAX_ALLOC_PCT = 0.130       # 1トレード最大配分 = 総資産の13.0% (BUY)
+SB_MAX_ALLOC_PCT = 0.140    # STRONG_BUY 最大配分 = 総資産の14.0%
 MIN_RISK_RATIO = 0.005      # 最低リスク距離 = 0.5%（極端低ボラ対策）
 SIGNAL_FILTER = None            # None or list: e.g. ["STRONG_BUY"] or ["BUY"] or None(全件)
 
-CSV_PATH = r"C:\Users\mh121\OneDrive\Desktop\swing_signal\output\backtest\signal_backtest_20260303_013237_sb_trail4.5.csv"
+CSV_PATH = r"C:\Users\mh121\OneDrive\Desktop\swing_signal\output\backtest\signal_backtest_20260303_022802_sb_trail4.0.csv"
 
 RESULT_LABELS = {
     "sl_hit":        "SL Hit",
