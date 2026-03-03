@@ -1,16 +1,17 @@
 """
-ETFオーバーレイ バックテスト
+ETFオーバーレイ バックテスト  v2（決定版）
 
 個別株スイング戦略 + ETFモメンタムオーバーレイ（待機資金活用）
 
-ETFルール:
-  ユニバース : SPY QQQ XLC XLY XLP XLE XLF XLV XLI XLB XLK XLRE XLU
+ETFルール（v2 週次）:
+  ユニバース  : SPY QQQ XLC XLY XLP XLE XLF XLV XLI XLB XLK XLRE XLU
   スコアリング: 1M×0.30 + 3M×0.30 + 6M×0.30 + 12M×0.10（順位ベース）
-  保有       : 上位2本（各ETFが50MA以上のみ）
-  リバランス : 毎月第1営業日（全待機資金を均等配分）
-  50MA割れ   : 即日売却 → 翌月リバランスまでキャッシュ
-  全売り     : なし
-  個別株資金 : スコア弱い方のETFから必要額だけ売却
+  リバランス  : 毎週月曜（週次）
+  保有        : 上位2本（各ETFが50MA以上のみ）
+  50MA割れ    : 即日売却
+  SPYレジーム : SPY > 200MA → ETFモメンタム
+                SPY < 200MA → 全セクターETF売却・SGOVで待避
+  個別株資金  : SGOVまたは弱いETFから必要額を売却
 """
 import csv
 import math
@@ -35,22 +36,24 @@ if hasattr(sys.stdout, "reconfigure"):
 BASE   = Path(__file__).resolve().parent
 CSV_IN = BASE / "output/backtest/signal_backtest_20260303_022802_sb_trail4.0.csv"
 
-INITIAL    = 4000.0
-RISK       = 0.005
-ALLOC      = 0.13
-SB_ALLOC   = 0.14
-MAX_POS    = 11
-MIN_RR     = 0.005
+INITIAL      = 4000.0
+RISK         = 0.005
+ALLOC        = 0.13
+SB_ALLOC     = 0.14
+MAX_POS      = 11
+MIN_RR       = 0.005
 
 ETF_UNIVERSE = [
-    "SPY","QQQ","XLC","XLY","XLP",
-    "XLE","XLF","XLV","XLI","XLB",
-    "XLK","XLRE","XLU",
+    "SPY", "QQQ", "XLC", "XLY", "XLP",
+    "XLE", "XLF", "XLV", "XLI", "XLB",
+    "XLK", "XLRE", "XLU",
 ]
-ETF_TOP_N  = 2
-ETF_MA     = 50   # 50日MA フィルター
+ETF_TOP_N    = 2
+ETF_MA       = 50
+SPY_TREND_MA = 200
+SAFE_TICKER  = "SGOV"
+REBAL_FREQ   = "weekly"   # "monthly" / "weekly" / "daily"
 
-# モメンタム期間: {名前: (取引日数, 重み)}
 MOMENTUM_PERIODS = {
     "1M":  (21,  0.30),
     "3M":  (63,  0.30),
@@ -60,7 +63,7 @@ MOMENTUM_PERIODS = {
 
 SIM_START  = "2021-01-04"
 SIM_END    = "2026-02-28"
-DATA_START = "2019-10-01"  # 12Mモメンタム計算のため早めに取得
+DATA_START = "2019-10-01"
 
 
 # ── 個別株シグナル読み込み ──────────────────────────────────────────
@@ -90,225 +93,224 @@ for i, t in enumerate(trades_raw):
 
 
 # ── ETFデータ取得 ──────────────────────────────────────────────────
-print(f"ETFデータ取得中（{len(ETF_UNIVERSE)}本）...")
-raw_all = yf.download(ETF_UNIVERSE, start=DATA_START, end=SIM_END,
+tickers_dl = ETF_UNIVERSE + [SAFE_TICKER]
+print(f"ETFデータ取得中（{len(tickers_dl)}本）...")
+raw_all = yf.download(tickers_dl, start=DATA_START, end=SIM_END,
                       auto_adjust=True, progress=False)
 
 etf_close: dict[str, pd.Series] = {}
-for ticker in ETF_UNIVERSE:
+for tk in tickers_dl:
     try:
-        if isinstance(raw_all.columns, pd.MultiIndex):
-            s = raw_all["Close"][ticker].dropna()
-        else:
-            s = raw_all["Close"].dropna()
-        etf_close[ticker] = s
+        s = raw_all["Close"][tk].dropna()
+        etf_close[tk] = s
     except Exception as e:
-        print(f"  Warning: {ticker} 取得失敗 - {e}")
+        print(f"  Warning: {tk} 取得失敗 - {e}")
 
 print(f"  取得完了: {list(etf_close.keys())}")
-
-# SPYベースライン用
 spy_series = etf_close.get("SPY")
 
 
 # ── ETF補助関数 ────────────────────────────────────────────────────
 def etf_price(ticker: str, date: pd.Timestamp) -> float | None:
     s = etf_close.get(ticker)
-    if s is None:
-        return None
+    if s is None: return None
     past = s[s.index <= date]
     return float(past.iloc[-1]) if len(past) > 0 else None
 
 
 def etf_ma(ticker: str, date: pd.Timestamp, period: int = ETF_MA) -> float | None:
     s = etf_close.get(ticker)
-    if s is None:
-        return None
+    if s is None: return None
     past = s[s.index <= date]
     return float(past.iloc[-period:].mean()) if len(past) >= period else None
 
 
+def spy_regime(date: pd.Timestamp) -> bool:
+    """True = ブル（SPY > 200MA）"""
+    s = etf_close.get("SPY")
+    if s is None: return True
+    past = s[s.index <= date]
+    if len(past) < SPY_TREND_MA: return True
+    return float(past.iloc[-1]) > float(past.iloc[-SPY_TREND_MA:].mean())
+
+
 def calc_momentum_scores(date: pd.Timestamp) -> list[tuple[str, float]]:
-    """全ETFのモメンタムスコアを計算。(ticker, score) リスト（スコア低い=強い）"""
     rets: dict[str, dict[str, float]] = {}
     for ticker in ETF_UNIVERSE:
         s = etf_close.get(ticker)
-        if s is None:
-            continue
+        if s is None: continue
         past = s[s.index <= date]
-        if len(past) == 0:
-            continue
+        if len(past) == 0: continue
         current = float(past.iloc[-1])
-        ticker_rets = {}
-        ok = True
+        tr = {}; ok = True
         for name, (days, _) in MOMENTUM_PERIODS.items():
-            if len(past) < days + 1:
-                ok = False
-                break
+            if len(past) < days + 1: ok = False; break
             base = float(past.iloc[-(days + 1)])
-            if base <= 0:
-                ok = False
-                break
-            ticker_rets[name] = (current - base) / base
-        if ok:
-            rets[ticker] = ticker_rets
-
-    if len(rets) < 2:
-        return []
-
-    # 各期間で順位付け → 加重スコア合算
+            if base <= 0: ok = False; break
+            tr[name] = (current - base) / base
+        if ok: rets[ticker] = tr
+    if len(rets) < 2: return []
     scores: dict[str, float] = {t: 0.0 for t in rets}
     for name, (_, weight) in MOMENTUM_PERIODS.items():
         ranked = sorted(rets.keys(), key=lambda t: rets[t][name], reverse=True)
         for rank, ticker in enumerate(ranked, 1):
             scores[ticker] += rank * weight
+    return sorted(scores.items(), key=lambda x: x[1])
 
-    return sorted(scores.items(), key=lambda x: x[1])  # 低スコア = 強い
 
-
-def select_target_etfs(date: pd.Timestamp,
-                       scored: list[tuple[str, float]]) -> list[str]:
-    """50MAフィルター適用後、上位N本を返す"""
+def select_target_etfs(date: pd.Timestamp, scored: list[tuple[str, float]]) -> list[str]:
     result = []
     for ticker, _ in scored:
-        if len(result) >= ETF_TOP_N:
-            break
-        p  = etf_price(ticker, date)
-        ma = etf_ma(ticker, date)
-        if p is not None and ma is not None and p >= ma:
-            result.append(ticker)
+        if len(result) >= ETF_TOP_N: break
+        p = etf_price(ticker, date); ma = etf_ma(ticker, date)
+        if p and ma and p >= ma: result.append(ticker)
     return result
+
+
+def get_period_key(date: pd.Timestamp) -> tuple:
+    if REBAL_FREQ == "weekly":
+        return (date.year, date.isocalendar()[1])
+    elif REBAL_FREQ == "daily":
+        return (date.year, date.month, date.day)
+    else:
+        return (date.year, date.month)
 
 
 # ── シミュレーション本体 ───────────────────────────────────────────
 def run_simulation(with_etf: bool) -> tuple[pd.DataFrame, list[dict], float]:
-    """
-    with_etf=True  → ETFオーバーレイあり
-    with_etf=False → ベースライン（個別株のみ）
-    Returns: (daily_df, trade_history, max_dd)
-    """
     bdays = pd.bdate_range(SIM_START, SIM_END)
 
     cash       = INITIAL
-    stock_pos  = {}   # trade_idx -> alloc ($)
-    etf_pos    = {}   # ticker -> shares (小数可)
+    stock_pos  = {}
+    etf_pos    = {}
     peak       = INITIAL
     max_dd     = 0.0
 
-    daily_records: list[dict]  = []
-    trade_history: list[dict]  = []
+    daily_records: list[dict] = []
+    trade_history: list[dict] = []
 
-    pe: set[int] = set()  # processed entries
-    px: set[int] = set()  # processed exits
+    pe: set[int] = set()
+    px: set[int] = set()
 
-    prev_month     = None
+    prev_period    = None
     current_scores: list[tuple[str, float]] = []
+    prev_bull      = None
 
     for date in bdays:
-        date_str = date.strftime("%Y-%m-%d")
+        date_str  = date.strftime("%Y-%m-%d")
+        bull      = spy_regime(date) if with_etf else True
+        reg_chg   = (prev_bull is not None and bull != prev_bull)
 
-        # ─── ① 月初リバランス ───────────────────────────────────
-        month_key = (date.year, date.month)
-        if with_etf and month_key != prev_month:
-            prev_month     = month_key
-            current_scores = calc_momentum_scores(date)
-            targets        = select_target_etfs(date, current_scores)
+        # ─── ① リバランス ─────────────────────────────────────────
+        period_key = get_period_key(date)
+        if with_etf and period_key != prev_period:
+            prev_period = period_key
+            if bull:
+                current_scores = calc_momentum_scores(date)
+                targets = select_target_etfs(date, current_scores)
+                for tk in list(etf_pos.keys()):
+                    if tk not in targets:
+                        p = etf_price(tk, date)
+                        if p: cash += etf_pos[tk] * p
+                        del etf_pos[tk]
+                if targets and cash > 1.0:
+                    alloc_each = cash / len(targets)
+                    for tk in targets:
+                        p = etf_price(tk, date)
+                        if p and p > 0:
+                            etf_pos[tk] = etf_pos.get(tk, 0.0) + alloc_each / p
+                            cash -= alloc_each
+            else:
+                for tk in list(etf_pos.keys()):
+                    if tk != SAFE_TICKER:
+                        p = etf_price(tk, date)
+                        if p: cash += etf_pos[tk] * p
+                        del etf_pos[tk]
+                sgov_p = etf_price(SAFE_TICKER, date)
+                if sgov_p and cash > 1.0:
+                    etf_pos[SAFE_TICKER] = etf_pos.get(SAFE_TICKER, 0.0) + cash / sgov_p
+                    cash = 0.0
 
-            # 非ターゲットETFを売却
-            for tk in list(etf_pos.keys()):
-                if tk not in targets:
-                    p = etf_price(tk, date)
-                    if p:
-                        cash += etf_pos[tk] * p
-                    del etf_pos[tk]
-
-            # 全現金をターゲットETFへ均等配分（追加購入）
-            if targets and cash > 1.0:
-                alloc_each = cash / len(targets)
-                for tk in targets:
-                    p = etf_price(tk, date)
-                    if p and p > 0:
-                        shares = alloc_each / p
-                        etf_pos[tk] = etf_pos.get(tk, 0.0) + shares
-                        cash -= alloc_each
-
-        # ─── ② 日次: 50MA割れチェック（即売り） ─────────────────
+        # ─── ② 日次: レジーム変化 + 50MA割れ ──────────────────────
         if with_etf:
-            for tk in list(etf_pos.keys()):
-                p  = etf_price(tk, date)
-                ma = etf_ma(tk, date)
-                if p and ma and p < ma:
-                    cash += etf_pos[tk] * p
-                    del etf_pos[tk]
+            if reg_chg and not bull:
+                sgov_p = etf_price(SAFE_TICKER, date)
+                for tk in list(etf_pos.keys()):
+                    if tk != SAFE_TICKER:
+                        p = etf_price(tk, date)
+                        if p: cash += etf_pos[tk] * p
+                        del etf_pos[tk]
+                if sgov_p and cash > 1.0:
+                    etf_pos[SAFE_TICKER] = etf_pos.get(SAFE_TICKER, 0.0) + cash / sgov_p
+                    cash = 0.0
+            elif reg_chg and bull:
+                if SAFE_TICKER in etf_pos:
+                    p = etf_price(SAFE_TICKER, date)
+                    if p: cash += etf_pos[SAFE_TICKER] * p
+                    del etf_pos[SAFE_TICKER]
+                for tk in list(etf_pos.keys()):
+                    p = etf_price(tk, date); ma = etf_ma(tk, date)
+                    if p and ma and p < ma:
+                        cash += etf_pos[tk] * p; del etf_pos[tk]
+            elif bull:
+                for tk in list(etf_pos.keys()):
+                    if tk == SAFE_TICKER: continue
+                    p = etf_price(tk, date); ma = etf_ma(tk, date)
+                    if p and ma and p < ma:
+                        cash += etf_pos[tk] * p; del etf_pos[tk]
 
-        # ─── ③ 個別株EXIT（同日を除く） ─────────────────────────
+        prev_bull = bull
+
+        # ─── ③ 個別株EXIT ─────────────────────────────────────────
         for idx in exits_by_date.get(date_str, []):
-            if idx in same_day:
-                continue
+            if idx in same_day: continue
             if idx in pe and idx not in px:
                 px.add(idx)
                 t   = trades_raw[idx]
                 amt = stock_pos.pop(idx)
                 pnl = amt * (t["pl_pct"] / 100)
                 cash += amt + pnl
-
-                etf_val = sum(etf_pos[tk] * (etf_price(tk, date) or 0)
-                              for tk in etf_pos)
+                etf_val = sum(etf_pos[tk] * (etf_price(tk, date) or 0) for tk in etf_pos)
                 bal = cash + sum(stock_pos.values()) + etf_val
-
-                if bal > peak:
-                    peak = bal
+                if bal > peak: peak = bal
                 dd = (peak - bal) / peak * 100 if peak > 0 else 0
-                if dd > max_dd:
-                    max_dd = dd
-
+                if dd > max_dd: max_dd = dd
                 trade_history.append({
-                    "date":    date,
-                    "ticker":  t["ticker"],
-                    "pl_pct":  t["pl_pct"],
-                    "pnl":     pnl,
-                    "balance": bal,
+                    "date": date, "ticker": t["ticker"],
+                    "pl_pct": t["pl_pct"], "pnl": pnl, "balance": bal,
                 })
 
-        # ─── ④ 個別株ENTRY ───────────────────────────────────────
-        etf_val   = sum(etf_pos[tk] * (etf_price(tk, date) or 0) for tk in etf_pos)
-        total_eq  = cash + sum(stock_pos.values()) + etf_val
+        # ─── ④ 個別株ENTRY ────────────────────────────────────────
+        etf_val  = sum(etf_pos[tk] * (etf_price(tk, date) or 0) for tk in etf_pos)
+        total_eq = cash + sum(stock_pos.values()) + etf_val
 
         for idx in entries_by_date.get(date_str, []):
-            if idx in pe:
-                continue
-            if len(stock_pos) >= MAX_POS:
-                continue
+            if idx in pe: continue
+            if len(stock_pos) >= MAX_POS: continue
+            t   = trades_raw[idx]
+            rr  = max((t["entry_price"] - t["sl_price"]) / t["entry_price"]
+                      if t["entry_price"] > 0 else 0.08, MIN_RR)
+            inv = (total_eq * RISK) / rr
+            ap  = SB_ALLOC if t["signal"] == "STRONG_BUY" else ALLOC
+            need = min(inv, total_eq * ap)
 
-            t  = trades_raw[idx]
-            rr = max((t["entry_price"] - t["sl_price"]) / t["entry_price"]
-                     if t["entry_price"] > 0 else 0.08, MIN_RR)
-            inv     = (total_eq * RISK) / rr
-            ap      = SB_ALLOC if t["signal"] == "STRONG_BUY" else ALLOC
-            need    = min(inv, total_eq * ap)
-
-            # 現金不足 → 弱い方のETFから売る
             if with_etf and cash < need and etf_pos:
-                shortage = need - cash
-                # スコアが弱い（数値大きい）順にソート
+                shortage  = need - cash
                 score_map = {tk: s for tk, s in current_scores}
-                ranked = sorted(etf_pos.keys(),
-                                key=lambda tk: score_map.get(tk, 999),
-                                reverse=True)
+                ranked = sorted(
+                    etf_pos.keys(),
+                    key=lambda tk: (0 if tk == SAFE_TICKER else 1,
+                                    score_map.get(tk, 999)),
+                    reverse=True,
+                )
                 for tk in ranked:
-                    if shortage <= 0:
-                        break
+                    if shortage <= 0: break
                     p = etf_price(tk, date)
-                    if not p:
-                        continue
-                    avail       = etf_pos[tk] * p
-                    sell        = min(shortage, avail)
-                    sell_shares = sell / p
-                    etf_pos[tk] -= sell_shares
-                    if etf_pos[tk] < 1e-9:
-                        del etf_pos[tk]
-                    cash     += sell
-                    shortage -= sell
+                    if not p: continue
+                    sell = min(shortage, etf_pos[tk] * p)
+                    etf_pos[tk] -= sell / p
+                    if etf_pos[tk] < 1e-9: del etf_pos[tk]
+                    cash += sell; shortage -= sell
 
             alloc = min(need, cash)
             if t["entry_price"] > 0:
@@ -316,173 +318,151 @@ def run_simulation(with_etf: bool) -> tuple[pd.DataFrame, list[dict], float]:
                 alloc = sh * t["entry_price"]
             else:
                 sh = 0
+            if alloc <= 0 or sh == 0 or cash <= 0: continue
+            cash -= alloc; stock_pos[idx] = alloc; pe.add(idx)
 
-            if alloc <= 0 or sh == 0 or cash <= 0:
-                continue
-
-            cash -= alloc
-            stock_pos[idx] = alloc
-            pe.add(idx)
-
-            # 同日EXIT
             if idx in same_day:
                 px.add(idx)
-                pnl  = alloc * (t["pl_pct"] / 100)
-                cash += alloc + pnl
+                cash += alloc + alloc * (t["pl_pct"] / 100)
                 stock_pos.pop(idx, None)
 
         # ─── ⑤ 日次スナップショット ──────────────────────────────
-        etf_val  = sum(etf_pos[tk] * (etf_price(tk, date) or 0) for tk in etf_pos)
+        etf_val   = sum(etf_pos[tk] * (etf_price(tk, date) or 0) for tk in etf_pos)
         stock_val = sum(stock_pos.values())
         total_eq  = cash + stock_val + etf_val
-
-        if total_eq > peak:
-            peak = total_eq
+        if total_eq > peak: peak = total_eq
         dd = (peak - total_eq) / peak * 100 if peak > 0 else 0
-        if dd > max_dd:
-            max_dd = dd
+        if dd > max_dd: max_dd = dd
+
+        sgov_val = etf_pos.get(SAFE_TICKER, 0.0) * (etf_price(SAFE_TICKER, date) or 0)
+        sect_val = etf_val - sgov_val
 
         daily_records.append({
             "date":      date,
             "balance":   total_eq,
             "cash":      cash,
             "stock_val": stock_val,
-            "etf_val":   etf_val,
+            "etf_val":   sect_val,
+            "sgov_val":  sgov_val,
             "n_stocks":  len(stock_pos),
-            "n_etfs":    len(etf_pos),
-            "etf_names": "+".join(sorted(etf_pos.keys())) if etf_pos else "-",
+            "etf_names": "+".join(sorted(k for k in etf_pos if k != SAFE_TICKER)) or "-",
         })
 
     df = pd.DataFrame(daily_records)
     return df, trade_history, max_dd
 
 
-# ── 両方実行 ──────────────────────────────────────────────────────
+# ── 実行 ──────────────────────────────────────────────────────────
 print("\nベースライン シミュレーション実行中...")
 df_base, hist_base, dd_base = run_simulation(with_etf=False)
 
-print("ETFオーバーレイ シミュレーション実行中...")
+print(f"ETFオーバーレイ v2（{REBAL_FREQ}）シミュレーション実行中...")
 df_etf, hist_etf, dd_etf = run_simulation(with_etf=True)
 
 
-# ── サマリー計算 ──────────────────────────────────────────────────
-def summary(df: pd.DataFrame, hist: list[dict], max_dd: float, label: str):
-    final   = df.iloc[-1]["balance"]
-    ret     = (final - INITIAL) / INITIAL * 100
-    n_tr    = len(hist)
-    wins    = sum(1 for h in hist if h["pnl"] > 0)
-    gp      = sum(h["pnl"] for h in hist if h["pnl"] > 0)
-    gl      = abs(sum(h["pnl"] for h in hist if h["pnl"] < 0))
-    pf      = gp / gl if gl > 0 else 9.99
-    wrate   = wins / n_tr * 100 if n_tr > 0 else 0
+# ── サマリー計算・出力 ────────────────────────────────────────────
+def summary(df, hist, max_dd, label):
+    final  = float(df.iloc[-1]["balance"])
+    ret    = (final - INITIAL) / INITIAL * 100
+    wins   = sum(1 for h in hist if h["pnl"] > 0)
+    gp     = sum(h["pnl"] for h in hist if h["pnl"] > 0)
+    gl     = abs(sum(h["pnl"] for h in hist if h["pnl"] < 0))
+    pf     = gp / gl if gl > 0 else 9.99
+    wr     = wins / len(hist) * 100 if hist else 0
+    r      = df.set_index("date")["balance"].pct_change().dropna()
+    sharpe = (r.mean() / r.std()) * np.sqrt(252) if r.std() > 0 else 0
+    calmar = ret / max_dd if max_dd > 0 else 0
+    yrs    = (pd.Timestamp(SIM_END) - pd.Timestamp(SIM_START)).days / 365.25
+    cagr   = (final / INITIAL) ** (1 / yrs) - 1
     print(f"\n=== {label} ===")
     print(f"  最終残高  : ${final:>10,.2f}")
     print(f"  リターン  : {ret:>+10.2f}%")
+    print(f"  CAGR      : {cagr*100:>+10.2f}%")
     print(f"  最大DD    : {max_dd:>10.2f}%")
-    print(f"  取引数    : {n_tr:>10}")
-    print(f"  勝率      : {wrate:>10.1f}%")
+    print(f"  Sharpe    : {sharpe:>10.3f}")
+    print(f"  Calmar    : {calmar:>10.2f}")
     print(f"  PF        : {pf:>10.3f}")
-    return final, ret
+    print(f"  勝率      : {wr:>10.1f}%")
+    print(f"  取引数    : {len(hist):>10,}")
+    return final, ret, cagr, max_dd, sharpe, calmar
+
+final_base, ret_base, cagr_base, dd_b, sh_b, cal_b = summary(df_base, hist_base, dd_base, "ベースライン（個別株のみ）")
+final_etf,  ret_etf,  cagr_etf,  dd_e, sh_e, cal_e = summary(df_etf,  hist_etf,  dd_etf,  f"ETF v2 {REBAL_FREQ}")
+
+print(f"\n  差分リターン: {ret_etf - ret_base:+.2f}%  "
+      f"差分P/L: ${final_etf - final_base:+,.2f}  "
+      f"Sharpe差: {sh_e - sh_b:+.3f}")
+
+# 年別
+print("\n=== 年別リターン比較 ===")
+print(f"{'年':<6} {'Base':>8} {'ETF v2':>8} {'差分':>8}")
+print("-" * 34)
+prev_b = prev_e = INITIAL
+for yr in range(2021, 2027):
+    b_yd = df_base[df_base["date"].dt.year == yr]
+    e_yd = df_etf[df_etf["date"].dt.year == yr]
+    if b_yd.empty: continue
+    b_end = float(b_yd.iloc[-1]["balance"]); e_end = float(e_yd.iloc[-1]["balance"])
+    b_r = (b_end - prev_b) / prev_b * 100; e_r = (e_end - prev_e) / prev_e * 100
+    print(f"{yr:<6} {b_r:>+7.1f}%  {e_r:>+7.1f}%  {e_r-b_r:>+6.1f}%")
+    prev_b = b_end; prev_e = e_end
+
+# 配分内訳
+avg_s  = df_etf["stock_val"].mean()
+avg_e  = df_etf["etf_val"].mean()
+avg_sg = df_etf["sgov_val"].mean()
+avg_c  = df_etf["cash"].mean()
+tot    = avg_s + avg_e + avg_sg + avg_c
+print(f"\n=== ETF v2 平均配分 ===")
+print(f"  個別株:     ${avg_s:>7,.0f}  ({avg_s/tot*100:.1f}%)")
+print(f"  セクターETF:  ${avg_e:>5,.0f}  ({avg_e/tot*100:.1f}%)")
+print(f"  SGOV:       ${avg_sg:>7,.0f}  ({avg_sg/tot*100:.1f}%)")
+print(f"  キャッシュ:   ${avg_c:>5,.0f}  ({avg_c/tot*100:.1f}%)")
 
 
-final_base, ret_base = summary(df_base, hist_base, dd_base, "ベースライン（個別株のみ）")
-final_etf,  ret_etf  = summary(df_etf,  hist_etf,  dd_etf,  "ETFオーバーレイ")
-
-print(f"\n  差分リターン: {ret_etf - ret_base:+.2f}%")
-print(f"  差分P/L    : ${final_etf - final_base:+,.2f}")
-
-# ── SPYデータ ──────────────────────────────────────────────────────
+# ── SPYデータ取得 ──────────────────────────────────────────────────
 spy_norm = None
 if spy_series is not None:
-    sim_spy = spy_series[spy_series.index >= pd.Timestamp(SIM_START)]
-    sim_spy = sim_spy[sim_spy.index <= pd.Timestamp(SIM_END)]
+    sim_spy  = spy_series[(spy_series.index >= pd.Timestamp(SIM_START)) &
+                           (spy_series.index <= pd.Timestamp(SIM_END))]
     spy_norm = sim_spy / sim_spy.iloc[0] * INITIAL
-
-
-# ── ETF保有推移の集計（月別） ─────────────────────────────────────
-etf_monthly: dict[str, dict[str, float]] = {}
-for _, row in df_etf.iterrows():
-    ym = row["date"].strftime("%Y-%m")
-    if ym not in etf_monthly:
-        etf_monthly[ym] = {tk: 0 for tk in ETF_UNIVERSE}
-        etf_monthly[ym]["CASH"] = 0
-    names = row["etf_names"].split("+") if row["etf_names"] != "-" else []
-    for tk in names:
-        if tk in etf_monthly[ym]:
-            etf_monthly[ym][tk] += 1
-    if not names:
-        etf_monthly[ym]["CASH"] += 1
-
-# 月別支配ETF（最も多く保有された日数）
-monthly_dominant: dict[str, str] = {}
-for ym, counts in etf_monthly.items():
-    dominant = max(counts, key=counts.get)
-    monthly_dominant[ym] = dominant
+    spy_ret  = (spy_norm.iloc[-1] / INITIAL - 1) * 100
 
 
 # ── チャート ──────────────────────────────────────────────────────
 print("\nチャート生成中...")
-
-ETF_COLORS = {
-    "SPY":  "#aaaaaa", "QQQ":  "#00d4ff", "XLC":  "#8ecae6",
-    "XLY":  "#ff9f1c", "XLP":  "#2ec4b6", "XLE":  "#e9c46a",
-    "XLF":  "#f4a261", "XLV":  "#a8dadc", "XLI":  "#457b9d",
-    "XLB":  "#6a994e", "XLK":  "#7b2d8b", "XLRE": "#e63946",
-    "XLU":  "#9b5de5", "CASH": "#444444", "-":    "#444444",
-}
-
-fig = plt.figure(figsize=(16, 20), facecolor="#0d1117")
+fig, axes = plt.subplots(3, 1, figsize=(16, 18), facecolor="#0d1117",
+                         gridspec_kw={"height_ratios": [3, 2, 1.5], "hspace": 0.4})
 fig.suptitle(
-    "ETF Overlay vs Baseline  |  risk=0.5%  trail4.0  |  Jan 2021 - Feb 2026",
-    color="white", fontsize=14, fontweight="bold", y=0.99,
+    f"ETF Overlay v2  ({REBAL_FREQ} rebalance  |  SPY 200MA regime  |  SGOV bear shelter)\n"
+    f"risk=0.5%  trail4.0  |  Jan 2021 – Feb 2026",
+    color="white", fontsize=13, fontweight="bold", y=0.99,
 )
-gs = fig.add_gridspec(4, 1, hspace=0.42, top=0.96, bottom=0.04,
-                      left=0.08, right=0.97,
-                      height_ratios=[3, 2, 1.5, 1.5])
 
-def style_ax(ax):
+def style(ax):
     ax.set_facecolor("#161b22")
     ax.tick_params(colors="#adbac7", labelsize=9)
-    for sp in ax.spines.values():
-        sp.set_edgecolor("#30363d")
+    for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
     ax.grid(True, color="#21262d", lw=0.7, linestyle="--")
+    for yr in range(2022, 2027):
+        ax.axvline(pd.Timestamp(f"{yr}-01-01"), color="#6e7681", lw=0.6, linestyle="--", alpha=0.4)
 
+COLORS = {"base": "#00d4ff", "etf": "#7ee787", "spy": "#888888"}
 
-# ─── Panel 1: 資産推移比較 ───────────────────────────────────────
-ax1 = fig.add_subplot(gs[0])
-style_ax(ax1)
-
+# Panel 1: 資産曲線
+ax1 = axes[0]; style(ax1)
 ax1.plot(df_etf["date"],  df_etf["balance"],
-         color="#7ee787", lw=2.5,
-         label=f"ETF Overlay  ${final_etf:,.0f}  ({ret_etf:+.1f}%)")
+         color=COLORS["etf"], lw=2.5,
+         label=f"ETF v2 ({REBAL_FREQ})  ${final_etf:,.0f}  ({ret_etf:+.1f}%)")
 ax1.plot(df_base["date"], df_base["balance"],
-         color="#00d4ff", lw=2.0, linestyle="--",
-         label=f"Baseline     ${final_base:,.0f}  ({ret_base:+.1f}%)")
+         color=COLORS["base"], lw=1.8, linestyle="--",
+         label=f"Baseline  ${final_base:,.0f}  ({ret_base:+.1f}%)")
 if spy_norm is not None:
-    spy_ret_pct = (spy_norm.iloc[-1] - INITIAL) / INITIAL * 100
     ax1.plot(spy_norm.index, spy_norm.values,
-             color="#888888", lw=1.3, alpha=0.7,
-             label=f"SPY              ${spy_norm.iloc[-1]:,.0f}  ({spy_ret_pct:+.1f}%)")
-
+             color=COLORS["spy"], lw=1.3, alpha=0.7,
+             label=f"SPY  ${spy_norm.iloc[-1]:,.0f}  ({spy_ret:+.1f}%)")
 ax1.axhline(INITIAL, color="#6e7681", lw=0.8, linestyle=":")
-for yr in range(2022, 2027):
-    ax1.axvline(pd.Timestamp(f"{yr}-01-01"), color="#6e7681",
-                lw=0.6, linestyle="--", alpha=0.4)
-
-# 年末バランス注記（ETFオーバーレイ）
-eq_idx = df_etf.set_index("date")["balance"]
-for yr in range(2021, 2026):
-    yr_end = pd.Timestamp(f"{yr}-12-31")
-    near   = eq_idx.index[eq_idx.index <= yr_end]
-    if len(near) == 0:
-        continue
-    d = near[-1]; v = float(eq_idx[d])
-    ax1.annotate(f"${v:,.0f}", xy=(d, v), xytext=(0, 14),
-                 textcoords="offset points", color="#7ee787",
-                 fontsize=8, ha="center",
-                 arrowprops=dict(arrowstyle="-", color="#7ee787", lw=0.7))
-
-ax1.set_title("Portfolio Value Comparison", color="white", fontsize=12, fontweight="bold")
+ax1.set_title("Portfolio Value", color="white", fontsize=12, fontweight="bold")
 ax1.set_ylabel("Value ($)", color="#adbac7")
 ax1.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
 ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -490,30 +470,23 @@ ax1.xaxis.set_major_locator(mdates.YearLocator())
 ax1.legend(facecolor="#21262d", edgecolor="#30363d", labelcolor="white",
            fontsize=10, loc="upper left")
 
-
-# ─── Panel 2: 資本配分（個別株・ETF・キャッシュ） ────────────────
-ax2 = fig.add_subplot(gs[1])
-style_ax(ax2)
-
+# Panel 2: 配分スタック
+ax2 = axes[1]; style(ax2)
 ax2.stackplot(
     df_etf["date"],
     df_etf["stock_val"].values,
     df_etf["etf_val"].values,
+    df_etf["sgov_val"].values,
     df_etf["cash"].values,
-    labels=[
-        f"Stocks  (avg ${df_etf['stock_val'].mean():,.0f})",
-        f"ETF     (avg ${df_etf['etf_val'].mean():,.0f})",
-        f"Cash    (avg ${df_etf['cash'].mean():,.0f})",
-    ],
-    colors=["#00d4ff", "#7ee787", "#f0a500"],
+    labels=[f"Stocks (avg ${avg_s:,.0f})",
+            f"Sector ETF (avg ${avg_e:,.0f})",
+            f"SGOV (avg ${avg_sg:,.0f})",
+            f"Cash (avg ${avg_c:,.0f})"],
+    colors=["#00d4ff", "#f0a500", "#7ee787", "#555555"],
     alpha=0.75,
 )
-for yr in range(2022, 2027):
-    ax2.axvline(pd.Timestamp(f"{yr}-01-01"), color="#6e7681",
-                lw=0.6, linestyle="--", alpha=0.5)
-
-ax2.set_title("Capital Allocation  (Stocks / ETF / Cash)", color="white",
-              fontsize=12, fontweight="bold")
+ax2.set_title("Capital Allocation  (Stocks / Sector ETF / SGOV / Cash)",
+              color="white", fontsize=12, fontweight="bold")
 ax2.set_ylabel("Amount ($)", color="#adbac7")
 ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
 ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -521,91 +494,35 @@ ax2.xaxis.set_major_locator(mdates.YearLocator())
 ax2.legend(facecolor="#21262d", edgecolor="#30363d", labelcolor="white",
            fontsize=9, loc="upper left")
 
+# Panel 3: 年別リターン比較
+ax3 = axes[2]; style(ax3)
+yr_list = list(range(2021, 2027))
+yrets_b, yrets_e = [], []
+prev_b2 = prev_e2 = INITIAL
+for yr in yr_list:
+    for lst, df in [(yrets_b, df_base), (yrets_e, df_etf)]:
+        yd = df[df["date"].dt.year == yr]
+        lst.append(0 if yd.empty else (float(yd.iloc[-1]["balance"]) - (prev_b2 if lst is yrets_b else prev_e2))
+                   / (prev_b2 if lst is yrets_b else prev_e2) * 100)
+    if not df_base[df_base["date"].dt.year == yr].empty:
+        prev_b2 = float(df_base[df_base["date"].dt.year == yr].iloc[-1]["balance"])
+    if not df_etf[df_etf["date"].dt.year == yr].empty:
+        prev_e2 = float(df_etf[df_etf["date"].dt.year == yr].iloc[-1]["balance"])
 
-# ─── Panel 3: 保有ETF（月別ヒートマップ風） ─────────────────────
-ax3 = fig.add_subplot(gs[2])
-style_ax(ax3)
-
-months   = sorted(monthly_dominant.keys())
-dom_etfs = [monthly_dominant[m] for m in months]
-month_ts = [pd.Timestamp(m + "-01") for m in months]
-colors3  = [ETF_COLORS.get(e, "#555555") for e in dom_etfs]
-
-for i, (ts, etf, col) in enumerate(zip(month_ts, dom_etfs, colors3)):
-    ax3.bar(ts, 1, width=25, color=col, alpha=0.85)
-    if i == 0 or dom_etfs[i] != dom_etfs[i - 1]:
-        ax3.text(ts, 0.5, etf, color="white", fontsize=7,
-                 ha="left", va="center", fontweight="bold")
-
-ax3.set_yticks([])
-ax3.set_title("Monthly ETF Holdings  (dominant position per month)", color="white",
-              fontsize=12, fontweight="bold")
-ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-ax3.xaxis.set_major_locator(mdates.YearLocator())
-ax3.set_xlim(pd.Timestamp(SIM_START), pd.Timestamp(SIM_END))
-
-# 凡例（保有されたETFのみ）
-held_etfs = sorted(set(dom_etfs) - {"-"})
-patches   = [plt.Rectangle((0, 0), 1, 1,
-             color=ETF_COLORS.get(e, "#555555"), alpha=0.85)
-             for e in held_etfs]
-ax3.legend(patches, held_etfs, facecolor="#21262d", edgecolor="#30363d",
-           labelcolor="white", fontsize=8, ncol=len(held_etfs),
-           loc="lower right")
-
-
-# ─── Panel 4: 年別リターン比較 ───────────────────────────────────
-ax4 = fig.add_subplot(gs[3])
-style_ax(ax4)
-
-years = sorted(set(
-    list(range(2021, 2027)) +
-    [d.year for d in df_base["date"]]
-))
-
-def yearly_returns(df: pd.DataFrame) -> dict[int, float]:
-    out = {}
-    prev = INITIAL
-    for yr in years:
-        yr_df = df[df["date"].dt.year == yr]
-        if yr_df.empty:
-            continue
-        end  = float(yr_df.iloc[-1]["balance"])
-        ret  = (end - prev) / prev * 100
-        out[yr] = ret
-        prev = end
-    return out
-
-yr_base = yearly_returns(df_base)
-yr_etf  = yearly_returns(df_etf)
-
-yr_list = sorted(set(yr_base) | set(yr_etf))
-x       = np.arange(len(yr_list))
-w       = 0.35
-
-bars1 = ax4.bar(x - w/2, [yr_base.get(y, 0) for y in yr_list],
-                width=w, color="#00d4ff", alpha=0.8, label="Baseline")
-bars2 = ax4.bar(x + w/2, [yr_etf.get(y, 0)  for y in yr_list],
-                width=w, color="#7ee787", alpha=0.8, label="ETF Overlay")
-
-ax4.axhline(0, color="#6e7681", lw=0.8)
-ax4.set_xticks(x)
-ax4.set_xticklabels([str(y) for y in yr_list], color="#adbac7")
-ax4.set_ylabel("Return (%)", color="#adbac7")
-ax4.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:+.0f}%"))
-ax4.set_title("Annual Return Comparison", color="white", fontsize=12, fontweight="bold")
-ax4.legend(facecolor="#21262d", edgecolor="#30363d", labelcolor="white", fontsize=9)
-
-for bar, yr in zip(bars2, yr_list):
-    v = yr_etf.get(yr, 0)
-    ax4.text(bar.get_x() + bar.get_width() / 2,
-             v + (1 if v >= 0 else -2),
-             f"{v:+.0f}%",
+x = np.arange(len(yr_list)); w = 0.35
+ax3.bar(x - w/2, yrets_b, width=w, color=COLORS["base"], alpha=0.8, label="Baseline")
+ax3.bar(x + w/2, yrets_e, width=w, color=COLORS["etf"],  alpha=0.8, label=f"ETF v2 ({REBAL_FREQ})")
+ax3.axhline(0, color="#6e7681", lw=0.8)
+ax3.set_xticks(x); ax3.set_xticklabels([str(y) for y in yr_list], color="#adbac7")
+ax3.set_ylabel("Return (%)", color="#adbac7")
+ax3.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:+.0f}%"))
+ax3.set_title("Annual Return Comparison", color="white", fontsize=12, fontweight="bold")
+ax3.legend(facecolor="#21262d", edgecolor="#30363d", labelcolor="white", fontsize=9)
+for i, v in enumerate(yrets_e):
+    ax3.text(i + w/2, v + (1 if v >= 0 else -2.5), f"{v:+.0f}%",
              ha="center", va="bottom" if v >= 0 else "top",
-             color="#7ee787", fontsize=8)
+             color=COLORS["etf"], fontsize=8)
 
-
-# ── 保存 ──────────────────────────────────────────────────────────
 out_path = BASE / "output/backtest/etf_overlay_result.png"
 plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#0d1117")
 plt.close()
