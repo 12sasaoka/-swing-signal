@@ -40,6 +40,9 @@ RESULT_LABELS = {
     "timeout_90d":   "TO-90d",
     "timeout":       "Timeout",
     "pre_earnings":  "Pre-Earn",
+    "riopon_20d":    "Riopon-1M",
+    "riopon_40d":    "Riopon-2M",
+    "riopon_60d":    "Riopon-3M",
 }
 
 

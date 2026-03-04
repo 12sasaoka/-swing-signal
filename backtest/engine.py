@@ -71,6 +71,8 @@ def _compute_phase1_cache_key(tickers: list, has_quarterly: bool) -> str:
         str(DIP_FILTER_ENABLED),
         str(DIP_MIN_PCT),
         str(DIP_MAX_PCT),
+        str(TREND_STRENGTH_FILTER_ENABLED),
+        str(TREND_STRENGTH_52W_MIN_RATIO),
         str(OVERBOUGHT_5D_THRESHOLD),
         str(SPY_HOT_5D_THRESHOLD),
         str(POST_EARNINGS_WINDOW_DAYS),
@@ -296,6 +298,14 @@ def _score_ticker_phase1(args):
                 if avg_vol > 0 and current_vol < avg_vol * VOLUME_FILTER_MULTIPLIER:
                     continue  # 出来高不足 → スキップ
 
+            # ---- Option C: 52週高値トレンド強度フィルター（ハードフィルター）----
+            # 長期下降トレンド（52週高値から25%超下落）の銘柄を除外
+            if TREND_STRENGTH_FILTER_ENABLED and len(window_df) >= TREND_STRENGTH_52W_LOOKBACK:
+                _high_52w = float(window_df["Close"].iloc[-TREND_STRENGTH_52W_LOOKBACK:].max())
+                _cur_close_ts = float(window_df["Close"].iloc[-1])
+                if _high_52w > 0 and _cur_close_ts < _high_52w * TREND_STRENGTH_52W_MIN_RATIO:
+                    continue  # 52週高値から大きく下落中 → スキップ
+
             # ---- 案7: 市場ディップ日スコアボーナス ----
             # りおぽん: 「好調な上昇相場では買わない。ディップの日に仕込む」
             # ※ハードフィルターではなくスコアボーナスに変更（機会損失を防ぐ）
@@ -412,6 +422,15 @@ STAGED_TIMEOUT = [
     (30, 0.00),   # 30営業日: 含み損（< 0%）なら決済（継続監視）
     # (15, 0.05) は削除 — 優良トレードを早期に切りすぎて平均損益を悪化させた
 ]
+
+# りおぽん式パフォーマンス足切り設定
+# (経過営業日, 含み益下限, 含み益上限) — 下限 < pl_pct < 上限 なら決済（含み益ポジションのみ）
+# 1ヶ月7%ペースで伸びていない含み益ポジションを整理し資金効率を高める
+RIOPON_TIMEOUT = [
+    (40, 0.00, 0.14),   # 40営業日（≈2ヶ月）: 含み益 > 0% かつ < 14% → 足切り
+    (60, 0.00, 0.21),   # 60営業日（≈3ヶ月）: 含み益 > 0% かつ < 21% → 足切り
+]
+RIOPON_TIMEOUT_ENABLED = False  # 検証済み: ベースラインより劣化するため無効化
 # 絶対タイムアウト（無条件で強制決済）
 # 【案11: 旬の賞味期限は最長3ヶ月 → 90日→60日】
 MAX_HOLD_DAYS = 60
@@ -442,6 +461,10 @@ BREAKEVEN_TRIGGER_ATR: float = 1.0
 # ブレイクイーブンラチェット: トリガー後のロック水準 = entry_price + atr × この値
 # 0.0 = 従来通り 0% ロック、0.5 = +0.5ATR（約+1〜2%）でロック
 BREAKEVEN_LOCK_ATR: float = 1.0
+# BEロック最低保有日数: エントリーからこの営業日数未満ではBEロックを発動しない
+# 【Option A】検証済み: 大幅悪化 (+84.7% vs baseline +175.6%) のため事実上無効化
+# BEロックを遅らせると+2%退場が-6%SL退場に変わりむしろ損失増
+BREAKEVEN_TRIGGER_DAYS: int = 0  # 0 = 無効（即発動、ベースラインと同等）
 
 # 【案6: 直近高値ベーストレーリング】
 # りおぽん: 「直近高値から5%以上下落したら利確検討」
@@ -470,6 +493,13 @@ DIP_FILTER_ENABLED: bool = True
 DIP_LOOKBACK: int = 20          # 高値計算のルックバック（営業日）
 DIP_MIN_PCT: float = 0.03       # 最低3%下落（高値近辺はスキップ）
 DIP_MAX_PCT: float = 0.20       # 最大20%下落（急落すぎはスキップ）
+
+# 【Option C: 52週高値トレンド強度フィルター（ハードフィルター）】
+# 長期下降トレンドにある銘柄（52週高値から大きく下落した銘柄）を除外する
+# 一瞬だけ反発して小益退場を繰り返す弱い銘柄（NRG×6, SFM×4等）を事前に排除
+TREND_STRENGTH_FILTER_ENABLED: bool = False  # 検証済み: ベースライン比 -7% のため無効化
+TREND_STRENGTH_52W_LOOKBACK: int = 252   # 52週 ≈ 252 営業日
+TREND_STRENGTH_52W_MIN_RATIO: float = 0.75  # 52週高値の75%以上の銘柄のみ許可（25%超下落は除外）
 
 # 【案7: 市場過熱フィルター】
 # りおぽん: 「好調な上昇相場では買わない」
@@ -1263,6 +1293,7 @@ def _get_trail_level(
     entry_price: float,
     atr: float,
     trail_mult_override: float | None = None,
+    holding_days: int = 0,
 ) -> float:
     """段階的トレーリングストップの水準を返す。
 
@@ -1315,8 +1346,8 @@ def _get_trail_level(
     # 2つのトレーリングの高い方（より早く発動する方）を採用
     trail = max(trail_atr, trail_peak)
 
-    # ブレイクイーブン床: 含み益 ≥ BREAKEVEN_TRIGGER_ATR → SL はエントリー価格 + ATR×ラチェット以上
-    if peak_profit_atr >= BREAKEVEN_TRIGGER_ATR:
+    # ブレイクイーブン床: 含み益 ≥ BREAKEVEN_TRIGGER_ATR かつ最低保有日数経過 → SL ≥ entry + ATR×ラチェット
+    if peak_profit_atr >= BREAKEVEN_TRIGGER_ATR and holding_days >= BREAKEVEN_TRIGGER_DAYS:
         trail = max(trail, entry_price + atr * BREAKEVEN_LOCK_ATR)
 
     return trail
@@ -1387,7 +1418,8 @@ def _simulate_trade(
         # トレーリングストップ判定（STRONG_BUY は広めの倍率を使用）
         # 【案1】エントリーから5営業日間はトレーリングストップを停止（SLは通常通り有効）
         trail_level = _get_trail_level(highest_high, entry_price, atr,
-                                       trail_mult_override=_trail_mult)
+                                       trail_mult_override=_trail_mult,
+                                       holding_days=holding_days)
         if holding_days > 5 and trail_level >= entry_price and close <= trail_level:
             pl_pct = (trail_level - entry_price) / entry_price
             return TradeResult(
@@ -1410,6 +1442,20 @@ def _simulate_trade(
                         exit_date=date_str, exit_price=close,
                         result=f"timeout_{threshold_days}d",
                         pl_pct=pl_pct,
+                        sl_price=sl_price, tp_price=0.0, score=score,
+                    )
+
+        # りおぽん式パフォーマンス足切り（含み益ポジションのみ）
+        if RIOPON_TIMEOUT_ENABLED:
+            _rp_pl = (close - entry_price) / entry_price
+            for rp_days, rp_low, rp_high in RIOPON_TIMEOUT:
+                if holding_days == rp_days and rp_low < _rp_pl < rp_high:
+                    return TradeResult(
+                        ticker=ticker, signal=signal, signal_date=signal_date,
+                        entry_date=entry_date, entry_price=entry_price,
+                        exit_date=date_str, exit_price=close,
+                        result=f"riopon_{rp_days}d",
+                        pl_pct=_rp_pl,
                         sl_price=sl_price, tp_price=0.0, score=score,
                     )
 
@@ -1476,6 +1522,15 @@ def _check_exit(
     _max_hold     = SB_MAX_HOLD_DAYS if is_strong_buy else MAX_HOLD_DAYS
     _use_timeout  = SB_STAGED_TIMEOUT_ENABLED if is_strong_buy else True
 
+    # 保有日数を計算（BEロック最低保有日数チェック用）
+    try:
+        _entry_dt = pd.Timestamp(position.entry_date)
+        _cur_dt = pd.Timestamp(current_date_str)
+        _cal_days = (_cur_dt - _entry_dt).days
+        _holding_biz_days = int(_cal_days * 5 / 7)
+    except Exception:
+        _holding_biz_days = 0
+
     # SL判定（ギャップダウン対応: 始値がSL以下なら始値で約定）
     if low <= position.sl_price or open_price <= position.sl_price:
         exit_price = min(position.sl_price, open_price)
@@ -1490,7 +1545,8 @@ def _check_exit(
 
     # トレーリングストップ判定（STRONG_BUY は広めの倍率）
     trail_level = _get_trail_level(highest_high, position.entry_price, atr,
-                                   trail_mult_override=_trail_mult)
+                                   trail_mult_override=_trail_mult,
+                                   holding_days=_holding_biz_days)
     if trail_level >= position.entry_price and close <= trail_level:
         pl_pct = (trail_level - position.entry_price) / position.entry_price
         return TradeResult(
@@ -1534,6 +1590,19 @@ def _check_exit(
                             pl_pct=pl_pct,
                             sl_price=position.sl_price, tp_price=0.0, score=position.score,
                         ), highest_high
+
+        # りおぽん式パフォーマンス足切り（含み益ポジションのみ）
+        if RIOPON_TIMEOUT_ENABLED:
+            for rp_days, rp_low, rp_high in RIOPON_TIMEOUT:
+                if (rp_days - 2) <= approx_biz_days <= (rp_days + 2) and rp_low < pl_pct < rp_high:
+                    return TradeResult(
+                        ticker=position.ticker, signal=position.signal,
+                        signal_date=position.signal_date, entry_date=position.entry_date,
+                        entry_price=position.entry_price, exit_date=current_date_str,
+                        exit_price=close, result=f"riopon_{rp_days}d",
+                        pl_pct=pl_pct,
+                        sl_price=position.sl_price, tp_price=0.0, score=position.score,
+                    ), highest_high
 
         # 絶対タイムアウト（STRONG_BUY: 90日, BUY: 60日）
         if approx_biz_days >= _max_hold:
