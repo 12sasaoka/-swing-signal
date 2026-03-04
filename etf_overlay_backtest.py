@@ -527,3 +527,8 @@ out_path = BASE / "output/backtest/etf_overlay_result.png"
 plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#0d1117")
 plt.close()
 print(f"\nチャート保存: {out_path}")
+
+# ── CSV出力 ──────────────────────────────────────────────────────────
+daily_out = BASE / "output/backtest/etf_v2_weekly_daily.csv"
+df_etf.to_csv(daily_out, index=False)
+print(f"日次スナップショット保存: {daily_out}  ({len(df_etf)} rows)")

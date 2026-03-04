@@ -550,52 +550,339 @@ with tab5:
         )
         st.plotly_chart(fig6, use_container_width=True)
 
-# ── Tab 6: ETFオーバーレイ ────────────────────────────────────────
+# ── Tab 6: ETFオーバーレイ v2 weekly ────────────────────────────────────────
 with tab6:
-    st.subheader("ETFオーバーレイ バックテスト結果")
+    etf_daily_path = CSV_DIR / "etf_v2_weekly_daily.csv"
+    etf_txn_path   = CSV_DIR / "etf_v2_txn_history.csv"
+
+    if not etf_daily_path.exists():
+        st.warning("ETF v2データが未生成です。`python etf_overlay_backtest.py` を実行してください。")
+        st.stop()
+
+    @st.cache_data(ttl=3600)
+    def load_etf_daily(path_str: str):
+        return pd.read_csv(path_str, parse_dates=["date"])
+
+    @st.cache_data(ttl=3600)
+    def get_qqq(start: str, end: str):
+        raw = yf.download("QQQ", start=start, end=end, progress=False, auto_adjust=True)
+        qqq = (raw["Close"]["QQQ"] if isinstance(raw.columns, pd.MultiIndex)
+               else raw["Close"]).dropna()
+        return qqq
+
+    df_etf_d = load_etf_daily(str(etf_daily_path))
+    qqq      = get_qqq(start_str, end_str)
+    qqq_norm = qqq / qqq.iloc[0] * INITIAL
+    qqq_ret  = (float(qqq.iloc[-1]) - float(qqq.iloc[0])) / float(qqq.iloc[0]) * 100
+
+    # ── ETF v2 メトリクス計算 ─────────────────────────────────────
+    final_etf  = float(df_etf_d.iloc[-1]["balance"])
+    ret_etf    = (final_etf - INITIAL) / INITIAL * 100
+    r_etf      = df_etf_d.set_index("date")["balance"].pct_change().dropna()
+    sharpe_etf = (r_etf.mean() / r_etf.std()) * np.sqrt(252) if r_etf.std() > 0 else 0
+    bal_arr    = df_etf_d["balance"].values
+    peak_arr   = np.maximum.accumulate(bal_arr)
+    max_dd_etf = float(((peak_arr - bal_arr) / peak_arr * 100).max())
+    yrs_etf    = (df_etf_d["date"].iloc[-1] - df_etf_d["date"].iloc[0]).days / 365.25
+    cagr_etf   = ((final_etf / INITIAL) ** (1 / yrs_etf) - 1) * 100
+    calmar_etf = ret_etf / max_dd_etf if max_dd_etf > 0 else 0
+
+    # ── ベースライン追加メトリクス ────────────────────────────────
+    r_base      = eq_s.pct_change().dropna()
+    sharpe_base = (r_base.mean() / r_base.std()) * np.sqrt(252) if r_base.std() > 0 else 0
+    cagr_base   = ((final_bal / INITIAL) ** (1 / yrs_etf) - 1) * 100
+    calmar_base = total_ret / max_dd if max_dd > 0 else 0
+
+    # ── ヘッダー ──────────────────────────────────────────────────
+    st.subheader("ETFオーバーレイ v2 weekly — 総合分析")
     st.caption(
-        "待機資金をモメンタム上位ETF（最大2本）に自動投資する戦略。"
-        "個別株シグナル時はETFを一部売却して資金を確保。"
+        "個別株スイング + モメンタム上位ETF（最大2本）の複合戦略。"
+        "SPY 200MA レジームフィルター付き。ベア時 SGOV 待避。毎週月曜リバランス。"
     )
 
-    # ── KPI比較 ──────────────────────────────────────────────────
-    ETF_OVERLAY_RESULTS = {
-        "ベースライン": {"残高": 11146.92, "リターン": 178.67, "最大DD": 12.45, "PF": 1.701},
-        "ETFオーバーレイ": {"残高": 12076.26, "リターン": 201.91, "最大DD": 21.45, "PF": 1.708},
-    }
-    col1, col2, col3, col4 = st.columns(4)
-    diff_ret = ETF_OVERLAY_RESULTS["ETFオーバーレイ"]["リターン"] - ETF_OVERLAY_RESULTS["ベースライン"]["リターン"]
-    diff_bal = ETF_OVERLAY_RESULTS["ETFオーバーレイ"]["残高"]    - ETF_OVERLAY_RESULTS["ベースライン"]["残高"]
-    diff_dd  = ETF_OVERLAY_RESULTS["ETFオーバーレイ"]["最大DD"]  - ETF_OVERLAY_RESULTS["ベースライン"]["最大DD"]
-    col1.metric("最終残高（ETF）",     f"${ETF_OVERLAY_RESULTS['ETFオーバーレイ']['残高']:,.0f}",
-                f"+${diff_bal:,.0f} vs Baseline")
-    col2.metric("トータルリターン（ETF）", f"+{ETF_OVERLAY_RESULTS['ETFオーバーレイ']['リターン']:.1f}%",
-                f"{diff_ret:+.1f}% vs Baseline")
-    col3.metric("最大DD（ETF）",       f"{ETF_OVERLAY_RESULTS['ETFオーバーレイ']['最大DD']:.1f}%",
-                f"{diff_dd:+.1f}% vs Baseline", delta_color="inverse")
-    col4.metric("PF（ETF）",           f"{ETF_OVERLAY_RESULTS['ETFオーバーレイ']['PF']:.3f}",
-                f"Baseline: {ETF_OVERLAY_RESULTS['ベースライン']['PF']:.3f}")
+    # ── KPI 6列 ──────────────────────────────────────────────────
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("最終残高",  f"${final_etf:,.0f}",    f"Base: ${final_bal:,.0f}")
+    k2.metric("リターン",  f"{ret_etf:+.1f}%",      f"SPY:{spy_ret:+.1f}%  QQQ:{qqq_ret:+.1f}%")
+    k3.metric("CAGR",      f"{cagr_etf:+.1f}%",     f"Base: {cagr_base:+.1f}%")
+    k4.metric("最大DD",    f"{max_dd_etf:.1f}%",    f"Base: {max_dd:.1f}%", delta_color="inverse")
+    k5.metric("Sharpe",    f"{sharpe_etf:.3f}",     f"Base: {sharpe_base:.3f}")
+    k6.metric("Calmar",    f"{calmar_etf:.2f}",     f"Base: {calmar_base:.2f}")
 
     st.divider()
 
-    # ── チャート画像 ──────────────────────────────────────────────
-    chart_path = BASE / "output/backtest/etf_overlay_result.png"
-    if chart_path.exists():
-        st.image(str(chart_path), use_container_width=True)
-    else:
-        st.warning("チャートが見つかりません。先に `etf_overlay_backtest.py` を実行してください。")
-        st.code("python etf_overlay_backtest.py")
+    # ── サブタブ ─────────────────────────────────────────────────
+    et1, et2, et3, et4, et5 = st.tabs(
+        ["📈 資産推移", "🗂 資本配分", "📅 年別比較", "📋 取引履歴", "📖 戦略ルール"]
+    )
 
-    # ── ETFルール説明 ────────────────────────────────────────────
-    st.divider()
-    st.subheader("ETFオーバーレイ ルール")
-    col_l, col_r = st.columns(2)
-    with col_l:
-        st.markdown("""
-**ユニバース（13本）**
+    # ─── Et1: 資産推移 ──────────────────────────────────────────
+    with et1:
+        fig_e = go.Figure()
+        fig_e.add_trace(go.Scatter(
+            x=df_etf_d["date"], y=df_etf_d["balance"],
+            name=f"ETF v2 weekly  ${final_etf:,.0f}  ({ret_etf:+.1f}%)",
+            line=dict(color="#7ee787", width=2.5),
+            fill="tozeroy", fillcolor="rgba(126,231,135,0.05)",
+        ))
+        fig_e.add_trace(go.Scatter(
+            x=eq_s.index, y=eq_s.values,
+            name=f"個別株のみ  ${final_bal:,.0f}  ({total_ret:+.1f}%)",
+            line=dict(color="#00d4ff", width=1.8, dash="dash"),
+        ))
+        fig_e.add_trace(go.Scatter(
+            x=spy_norm.index, y=spy_norm.values,
+            name=f"SPY  ${spy_norm.iloc[-1]:,.0f}  ({spy_ret:+.1f}%)",
+            line=dict(color="#888888", width=1.3, dash="dot"),
+        ))
+        fig_e.add_trace(go.Scatter(
+            x=qqq_norm.index, y=qqq_norm.values,
+            name=f"QQQ  ${qqq_norm.iloc[-1]:,.0f}  ({qqq_ret:+.1f}%)",
+            line=dict(color="#f0a500", width=1.3, dash="dot"),
+        ))
+        fig_e.add_hline(y=INITIAL, line_dash="dot", line_color="#6e7681",
+                        annotation_text=f"${INITIAL:,.0f}", annotation_position="left")
+
+        for yr_ann in yr_stats:
+            yr_end = pd.Timestamp(f"{yr_ann}-12-31")
+            mask   = df_etf_d["date"] <= yr_end
+            if mask.sum() == 0: continue
+            last   = df_etf_d[mask].iloc[-1]
+            fig_e.add_annotation(
+                x=last["date"], y=last["balance"],
+                text=f"${last['balance']:,.0f}",
+                showarrow=True, arrowhead=2, arrowcolor="#7ee787",
+                font=dict(color="#7ee787", size=10), ax=0, ay=-35,
+            )
+
+        fig_e.update_layout(
+            title="ETF v2 weekly vs 個別株 / SPY / QQQ  （初期資金 $4,000）",
+            xaxis_title="日付", yaxis_title="残高 ($)",
+            yaxis_tickformat="$,.0f",
+            hovermode="x unified", height=520,
+            legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.5)"),
+        )
+        st.plotly_chart(fig_e, use_container_width=True)
+
+        # 比較テーブル
+        cmp_df = pd.DataFrame({
+            "戦略":    ["ETF v2 weekly", "個別株のみ", "SPY", "QQQ"],
+            "最終残高": [f"${final_etf:,.0f}", f"${final_bal:,.0f}",
+                        f"${spy_norm.iloc[-1]:,.0f}", f"${qqq_norm.iloc[-1]:,.0f}"],
+            "リターン": [f"{ret_etf:+.1f}%", f"{total_ret:+.1f}%",
+                        f"{spy_ret:+.1f}%", f"{qqq_ret:+.1f}%"],
+            "CAGR":    [f"{cagr_etf:+.1f}%", f"{cagr_base:+.1f}%", "—", "—"],
+            "最大DD":  [f"{max_dd_etf:.1f}%", f"{max_dd:.1f}%", "—", "—"],
+            "Sharpe":  [f"{sharpe_etf:.3f}", f"{sharpe_base:.3f}", "—", "—"],
+            "Calmar":  [f"{calmar_etf:.2f}", f"{calmar_base:.2f}", "—", "—"],
+        })
+        st.dataframe(cmp_df, use_container_width=True, hide_index=True)
+
+    # ─── Et2: 資本配分 ──────────────────────────────────────────
+    with et2:
+        avg_s  = df_etf_d["stock_val"].mean()
+        avg_e  = df_etf_d["etf_val"].mean()
+        avg_sg = df_etf_d["sgov_val"].mean()
+        avg_c  = df_etf_d["cash"].mean()
+        tot_   = avg_s + avg_e + avg_sg + avg_c
+
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            fig_al = go.Figure()
+            for label, col_name, color in [
+                (f"個別株 (avg ${avg_s:,.0f} / {avg_s/tot_*100:.1f}%)",    "stock_val", "rgba(0,212,255,0.65)"),
+                (f"セクターETF (avg ${avg_e:,.0f} / {avg_e/tot_*100:.1f}%)", "etf_val",  "rgba(240,165,0,0.65)"),
+                (f"SGOV (avg ${avg_sg:,.0f} / {avg_sg/tot_*100:.1f}%)",     "sgov_val", "rgba(126,231,135,0.65)"),
+                (f"現金 (avg ${avg_c:,.0f} / {avg_c/tot_*100:.1f}%)",       "cash",     "rgba(85,85,85,0.65)"),
+            ]:
+                fig_al.add_trace(go.Scatter(
+                    x=df_etf_d["date"], y=df_etf_d[col_name],
+                    name=label, stackgroup="one",
+                    fillcolor=color, line=dict(width=0),
+                ))
+            fig_al.update_layout(
+                title="資本配分の推移（個別株 / セクターETF / SGOV / 現金）",
+                yaxis_tickformat="$,.0f", hovermode="x unified", height=420,
+                legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.5)"),
+            )
+            st.plotly_chart(fig_al, use_container_width=True)
+
+        with col_b:
+            fig_pi = px.pie(
+                values=[avg_s, avg_e, avg_sg, avg_c],
+                names=["個別株", "セクターETF", "SGOV", "現金"],
+                color_discrete_sequence=["#00d4ff", "#f0a500", "#7ee787", "#555555"],
+                hole=0.4, title="全期間平均配分",
+            )
+            fig_pi.update_layout(height=320, margin=dict(t=40, b=10, l=5, r=5))
+            st.plotly_chart(fig_pi, use_container_width=True)
+
+            st.subheader("年別 現金率")
+            yr_cash_rows = {}
+            for yr_ in range(2021, 2027):
+                m = df_etf_d["date"].dt.year == yr_
+                if m.sum() == 0: continue
+                yr_cash_rows[yr_] = {
+                    "現金率":  f"{(df_etf_d.loc[m,'cash']    / df_etf_d.loc[m,'balance'] * 100).mean():.1f}%",
+                    "ETF率":   f"{(df_etf_d.loc[m,'etf_val'] / df_etf_d.loc[m,'balance'] * 100).mean():.1f}%",
+                    "SGOV率":  f"{(df_etf_d.loc[m,'sgov_val']/ df_etf_d.loc[m,'balance'] * 100).mean():.1f}%",
+                }
+            st.dataframe(pd.DataFrame(yr_cash_rows).T, use_container_width=True)
+
+    # ─── Et3: 年別比較 ──────────────────────────────────────────
+    with et3:
+        col_c, col_d = st.columns([3, 2])
+
+        etf_yr_rets, base_yr_rets, spy_yr_rets, qqq_yr_rets = {}, {}, {}, {}
+        prev_e = INITIAL
+        for yr_ in range(2021, 2027):
+            yd = df_etf_d[df_etf_d["date"].dt.year == yr_]
+            if yd.empty: continue
+            end_e = float(yd.iloc[-1]["balance"])
+            etf_yr_rets[yr_] = (end_e - prev_e) / prev_e * 100
+            prev_e = end_e
+
+        base_yr_rets = {yr_: s["ret"] for yr_, s in yr_stats.items()}
+
+        for yr_ in range(2021, 2027):
+            spy_yr = spy[spy.index.year == yr_]
+            if not spy_yr.empty:
+                spy_yr_rets[yr_] = (float(spy_yr.iloc[-1]) - float(spy_yr.iloc[0])) / float(spy_yr.iloc[0]) * 100
+            qqq_yr = qqq[qqq.index.year == yr_]
+            if not qqq_yr.empty:
+                qqq_yr_rets[yr_] = (float(qqq_yr.iloc[-1]) - float(qqq_yr.iloc[0])) / float(qqq_yr.iloc[0]) * 100
+
+        common_yrs = sorted(etf_yr_rets.keys())
+
+        with col_c:
+            fig_yr = go.Figure()
+            for name_, rets_, color_ in [
+                ("ETF v2", etf_yr_rets, "#7ee787"),
+                ("個別株", base_yr_rets, "#00d4ff"),
+                ("SPY",    spy_yr_rets,  "#888888"),
+                ("QQQ",    qqq_yr_rets,  "#f0a500"),
+            ]:
+                fig_yr.add_trace(go.Bar(
+                    x=[str(y) for y in common_yrs],
+                    y=[rets_.get(y, 0) for y in common_yrs],
+                    name=name_, marker_color=color_,
+                    text=[f"{rets_.get(y,0):+.1f}%" for y in common_yrs],
+                    textposition="outside",
+                ))
+            fig_yr.add_hline(y=0, line_color="#888")
+            fig_yr.update_layout(
+                barmode="group",
+                title="年別リターン比較（ETF v2 / 個別株 / SPY / QQQ）",
+                yaxis_ticksuffix="%", height=420,
+                legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.5)"),
+            )
+            st.plotly_chart(fig_yr, use_container_width=True)
+
+        with col_d:
+            yr_tbl = []
+            for yr_ in common_yrs:
+                yr_tbl.append({
+                    "年":           yr_,
+                    "ETF v2":       f"{etf_yr_rets.get(yr_,0):+.1f}%",
+                    "個別株":       f"{base_yr_rets.get(yr_,0):+.1f}%",
+                    "SPY":          f"{spy_yr_rets.get(yr_,0):+.1f}%",
+                    "QQQ":          f"{qqq_yr_rets.get(yr_,0):+.1f}%",
+                    "超過(vs SPY)": f"{etf_yr_rets.get(yr_,0)-spy_yr_rets.get(yr_,0):+.1f}%",
+                })
+            st.subheader("年別内訳")
+            st.dataframe(pd.DataFrame(yr_tbl), use_container_width=True, hide_index=True)
+
+    # ─── Et4: 取引履歴 ──────────────────────────────────────────
+    with et4:
+        txn_sub1, txn_sub2 = st.tabs(["📊 ETF取引", "📋 個別株取引"])
+
+        with txn_sub1:
+            if etf_txn_path.exists():
+                @st.cache_data(ttl=3600)
+                def load_etf_txn(path_str: str):
+                    return pd.read_csv(path_str, encoding="utf-8-sig")
+
+                df_txn = load_etf_txn(str(etf_txn_path))
+
+                col_f1, col_f2, col_f3 = st.columns(3)
+                with col_f1:
+                    act_f = st.selectbox("売買", ["全件", "BUY", "SELL"], key="etf_act")
+                with col_f2:
+                    tk_f  = st.selectbox("Ticker",
+                                         ["全件"] + sorted(df_txn["ticker"].unique().tolist()),
+                                         key="etf_tk")
+                with col_f3:
+                    yr_f  = st.selectbox("年",
+                                         ["全件"] + [str(y) for y in range(2021, 2027)],
+                                         key="etf_yr")
+
+                disp_txn = df_txn.copy()
+                if act_f != "全件": disp_txn = disp_txn[disp_txn["action"] == act_f]
+                if tk_f  != "全件": disp_txn = disp_txn[disp_txn["ticker"] == tk_f]
+                if yr_f  != "全件": disp_txn = disp_txn[disp_txn["date"].str.startswith(yr_f)]
+
+                st.caption(f"{len(disp_txn)} 件")
+                st.dataframe(disp_txn, use_container_width=True, hide_index=True)
+
+                col_r1, col_r2 = st.columns(2)
+                with col_r1:
+                    st.subheader("理由別集計")
+                    rsn = df_txn.groupby("reason")["value"].agg(
+                        件数="count", 合計金額="sum", 平均金額="mean"
+                    ).round(0).sort_values("合計金額", ascending=False)
+                    st.dataframe(rsn, use_container_width=True)
+                with col_r2:
+                    st.subheader("Ticker別 BUY集計")
+                    buy_df_ = df_txn[df_txn["action"] == "BUY"]
+                    buy_sum = buy_df_.groupby("ticker")["value"].agg(
+                        BUY回数="count", 合計投資額="sum", 平均投資額="mean"
+                    ).round(0).sort_values("合計投資額", ascending=False)
+                    st.dataframe(buy_sum, use_container_width=True)
+            else:
+                st.warning("ETF取引履歴が見つかりません。`python etf_txn_history.py` を実行してください。")
+
+        with txn_sub2:
+            st.caption("個別株のシグナル・エントリー・エグジットはETFオーバーレイの有無によらず同じです。")
+            col_g1, col_g2, col_g3 = st.columns(3)
+            with col_g1:
+                res_f2 = st.selectbox("終了理由", ["全件"] + sorted(df["result"].unique().tolist()), key="etf_res")
+            with col_g2:
+                yr_f2  = st.selectbox("年",
+                                      ["全件"] + sorted(df["date"].dt.year.unique().astype(str).tolist()),
+                                      key="etf_yr2")
+            with col_g3:
+                srt_f  = st.selectbox("並び替え", ["date", "pl_pct", "pnl", "ticker"], key="etf_srt")
+
+            disp2 = df.copy()
+            if res_f2 != "全件": disp2 = disp2[disp2["result"] == res_f2]
+            if yr_f2  != "全件": disp2 = disp2[disp2["date"].dt.year == int(yr_f2)]
+            disp2 = disp2.sort_values(srt_f, ascending=(srt_f not in ["pl_pct", "pnl"]))
+
+            show2 = disp2[["date", "ticker", "signal", "entry_date", "entry_price",
+                            "exit_price", "result", "pl_pct", "alloc", "pnl", "balance"]].copy()
+            show2.columns = ["決済日", "銘柄", "シグナル", "エントリー日", "買値$",
+                             "売値$", "終了理由", "損益%", "投資額$", "損益$", "残高$"]
+            show2["買値$"]   = show2["買値$"].map(lambda x: f"${x:.2f}")
+            show2["売値$"]   = show2["売値$"].map(lambda x: f"${x:.2f}")
+            show2["損益%"]   = show2["損益%"].map(lambda x: f"{x:+.2f}%")
+            show2["投資額$"] = show2["投資額$"].map(lambda x: f"${x:,.2f}")
+            show2["損益$"]   = show2["損益$"].map(lambda x: f"${x:+,.2f}")
+            show2["残高$"]   = show2["残高$"].map(lambda x: f"${x:,.2f}")
+            show2["決済日"]       = show2["決済日"].dt.strftime("%Y-%m-%d")
+            show2["エントリー日"] = show2["エントリー日"].dt.strftime("%Y-%m-%d")
+
+            st.caption(f"{len(disp2)} 件")
+            st.dataframe(show2, use_container_width=True, hide_index=True)
+
+    # ─── Et5: 戦略ルール ────────────────────────────────────────
+    with et5:
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.markdown("""
+**ETFユニバース（13本）**
 SPY / QQQ / XLC / XLY / XLP / XLE / XLF / XLV / XLI / XLB / XLK / XLRE / XLU
 
-**スコアリング（月1回）**
+**モメンタムスコアリング（週次）**
 - 1ヶ月リターン × 30%
 - 3ヶ月リターン × 30%
 - 6ヶ月リターン × 30%
@@ -603,16 +890,34 @@ SPY / QQQ / XLC / XLY / XLP / XLE / XLF / XLV / XLI / XLB / XLK / XLRE / XLU
 - 各期間で順位付け → 加重合計（低スコア = 強い）
 
 **保有本数**: 上位2本（50MA以上のみ）
-        """)
-    with col_r:
-        st.markdown("""
-**エントリー**: 毎月第1営業日にリバランス、全待機資金を均等配分
+**リバランス**: 毎週月曜日
+**50MA割れ**: 即日売却
+            """)
+        with col_r:
+            st.markdown("""
+**SPY レジームフィルター（200MA）**
 
-**50MA割れ**: 即日売却、翌月リバランスまでキャッシュ
+| 相場 | 判定 | アクション |
+|------|------|-----------|
+| ブル | SPY > 200MA | ETFモメンタム戦略 |
+| ベア | SPY < 200MA | セクターETF全売却 → SGOV待避 |
 
-**全売り**: なし（相場によって輝くセクターがあるため）
+**個別株シグナル時の資金確保順序**
+1. SGOV を優先的に売却
+2. スコアの弱いETFから必要額を売却
 
-**個別株シグナル時**: モメンタムスコアが弱いETFから必要額を売却
+**個別株EXIT後**: 翌週リバランスで自動再デプロイ
+            """)
 
-**個別株EXIT後**: 翌月リバランスで再デプロイ
-        """)
+        st.divider()
+        st.subheader("指標サマリー（2021-2026）")
+        summary_df = pd.DataFrame({
+            "指標":         ["最終残高", "リターン", "CAGR", "最大DD", "Sharpe", "Calmar", "PF", "勝率"],
+            "ETF v2 weekly": [f"${final_etf:,.0f}", f"{ret_etf:+.1f}%", f"{cagr_etf:+.1f}%",
+                              f"{max_dd_etf:.1f}%", f"{sharpe_etf:.3f}", f"{calmar_etf:.2f}",
+                              "1.719", "66.3%"],
+            "個別株のみ":   [f"${final_bal:,.0f}", f"{total_ret:+.1f}%", f"{cagr_base:+.1f}%",
+                              f"{max_dd:.1f}%", f"{sharpe_base:.3f}", f"{calmar_base:.2f}",
+                              f"{pf:.3f}", f"{winrate:.1f}%"],
+        })
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
