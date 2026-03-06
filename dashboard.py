@@ -293,8 +293,8 @@ c6.metric("Calmar",    f"{calmar_etf:.2f}",    f"Base: {calmar_base:.2f}")
 st.divider()
 
 # ── タブ ─────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📈 資産推移", "🗂 資本配分", "📅 年別", "📋 取引一覧", "📊 サマリー"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["📈 資産推移", "🗂 資本配分", "📅 年別", "📋 取引一覧", "📊 サマリー", "📉 チャート確認"]
 )
 
 # ── Tab 1: 資産推移 ───────────────────────────────────────────────
@@ -737,3 +737,156 @@ with tab5:
 
 **保有**: 上位2本（50MA以上）/ **リバランス**: 毎週月曜
         """)
+
+# ── Tab 6: チャート確認 ───────────────────────────────────────────
+@st.cache_data(ttl=300)
+def load_raw_trades_for_chart(csv_file: str):
+    path = CSV_DIR / csv_file
+    rows = []
+    with open(path, "r", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            entry = float(row["entry_price"])
+            sl    = float(row["sl_price"])
+            pl    = float(row["pl_pct"])
+            atr   = (entry - sl) / 2.0 if entry > sl else 0.001
+            rows.append({
+                "ticker":      row["ticker"],
+                "signal":      row["signal"],
+                "entry_date":  row["entry_date"],
+                "exit_date":   row["exit_date"],
+                "entry_price": entry,
+                "exit_price":  float(row["exit_price"]),
+                "pl_pct":      pl,
+                "sl_price":    sl,
+                "result":      row["result"],
+                "atr":         atr,
+                "be_level":    entry + atr,
+                "label": (
+                    f"{row['ticker']}  "
+                    f"{row['entry_date']}->{row['exit_date']}  "
+                    f"{pl:+.1f}%  [{row['result']}]"
+                ),
+            })
+    return rows
+
+
+@st.cache_data(ttl=3600)
+def fetch_chart_prices(ticker: str, entry_date: str, exit_date: str):
+    s = (pd.Timestamp(entry_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    e = (pd.Timestamp(exit_date)  + pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    df_p = yf.download(ticker, start=s, end=e, auto_adjust=True, progress=False)
+    if isinstance(df_p.columns, pd.MultiIndex):
+        df_p.columns = df_p.columns.get_level_values(0)
+    return df_p
+
+
+with tab6:
+    st.subheader("個別トレード チャート確認")
+    st.caption("エントリー前30日～エグジット後7日のローソク足。△=エントリー、▽=エグジット、赤破線=SL、橙点線=BEロック水準(entry+1ATR)")
+    raw_trades = load_raw_trades_for_chart(selected_csv)
+    col_t6a, col_t6b, col_t6c, col_t6d = st.columns(4)
+    with col_t6a:
+        res_opts = ["全件"] + sorted(set(t["result"] for t in raw_trades))
+        res_f = st.selectbox("終了理由", res_opts, key="t6_res")
+    with col_t6b:
+        sig_f = st.selectbox("シグナル", ["全件", "STRONG_BUY", "BUY"], key="t6_sig")
+    with col_t6c:
+        yr_opts = ["全件"] + sorted(set(t["entry_date"][:4] for t in raw_trades))
+        yr_f = st.selectbox("年", yr_opts, key="t6_yr")
+    with col_t6d:
+        pl_f = st.selectbox("損益", ["全件", "利確(+)", "損切(-)"], key="t6_pl")
+    filtered = raw_trades
+    if res_f != "全件":
+        filtered = [t for t in filtered if t["result"] == res_f]
+    if sig_f != "全件":
+        filtered = [t for t in filtered if t["signal"] == sig_f]
+    if yr_f != "全件":
+        filtered = [t for t in filtered if t["entry_date"].startswith(yr_f)]
+    if pl_f == "利確(+)":
+        filtered = [t for t in filtered if t["pl_pct"] > 0]
+    elif pl_f == "損切(-)":
+        filtered = [t for t in filtered if t["pl_pct"] <= 0]
+    filtered_sorted = sorted(filtered, key=lambda t: t["pl_pct"], reverse=True)
+    st.caption(f"{len(filtered_sorted)} 件該当")
+    if not filtered_sorted:
+        st.warning("該当する取引がありません。")
+    else:
+        labels = [t["label"] for t in filtered_sorted]
+        selected_label = st.selectbox("取引を選択（損益順）", labels, key="t6_trade")
+        trade = next(t for t in filtered_sorted if t["label"] == selected_label)
+        with st.spinner(f"{trade['ticker']} の価格データ取得中..."):
+            df_p = fetch_chart_prices(trade["ticker"], trade["entry_date"], trade["exit_date"])
+        if df_p.empty:
+            st.error("価格データが取得できませんでした。")
+        else:
+            entry_dt  = pd.Timestamp(trade["entry_date"])
+            exit_dt   = pd.Timestamp(trade["exit_date"])
+            mask = (
+                (df_p.index >= entry_dt - pd.Timedelta(days=35)) &
+                (df_p.index <= exit_dt  + pd.Timedelta(days=7))
+            )
+            plot_df = df_p[mask]
+            if plot_df.empty:
+                st.error("表示範囲のデータがありません。")
+            else:
+                ex_color  = "#7ee787" if trade["pl_pct"] > 0 else "#f85149"
+                hold_days = (exit_dt - entry_dt).days
+                fig_c = go.Figure()
+                fig_c.add_trace(go.Candlestick(
+                    x=plot_df.index,
+                    open=plot_df["Open"], high=plot_df["High"],
+                    low=plot_df["Low"],   close=plot_df["Close"],
+                    name="価格",
+                    increasing_line_color="#3fb950",
+                    decreasing_line_color="#f85149",
+                ))
+                fig_c.add_hline(y=trade["sl_price"], line_dash="dash", line_color="#f85149", line_width=1.5,
+                    annotation_text=f"SL ${trade['sl_price']:.2f}",
+                    annotation_position="left", annotation_font_color="#f85149")
+                fig_c.add_hline(y=trade["be_level"], line_dash="dot", line_color="#f0a500", line_width=1.5,
+                    annotation_text=f"BE ${trade['be_level']:.2f}",
+                    annotation_position="left", annotation_font_color="#f0a500")
+                entry_rows = df_p[df_p.index >= entry_dt]
+                if not entry_rows.empty:
+                    fig_c.add_trace(go.Scatter(
+                        x=[entry_rows.index[0]],
+                        y=[float(entry_rows.iloc[0]["Low"]) * 0.985],
+                        mode="markers+text",
+                        marker=dict(symbol="triangle-up", size=16, color="#3fb950"),
+                        text=["BUY"], textposition="bottom center",
+                        textfont=dict(color="#3fb950", size=12),
+                        name=f"Entry ${trade['entry_price']:.2f}",
+                    ))
+                exit_rows = df_p[df_p.index >= exit_dt]
+                if not exit_rows.empty:
+                    fig_c.add_trace(go.Scatter(
+                        x=[exit_rows.index[0]],
+                        y=[float(exit_rows.iloc[0]["High"]) * 1.015],
+                        mode="markers+text",
+                        marker=dict(symbol='triangle-down', size=16, color=ex_color),
+                        text=[f"{trade['pl_pct']:+.1f}%"], textposition="top center",
+                        textfont=dict(color=ex_color, size=12),
+                        name=f"Exit ${trade['exit_price']:.2f}  ({trade['pl_pct']:+.1f}%)",
+                    ))
+                fig_c.add_vline(x=entry_dt.timestamp()*1000, line_dash="dot", line_color="#3fb950", line_width=1, opacity=0.4)
+                fig_c.add_vline(x=exit_dt.timestamp()*1000,  line_dash="dot", line_color=ex_color, line_width=1, opacity=0.4)
+                fig_c.update_layout(
+                    title=dict(text=(
+                        f"{trade['ticker']}  {trade['signal']}  |  "
+                        f"{trade['entry_date']} -> {trade['exit_date']}  ({hold_days}日保有)  |  "
+                        f"P/L: {trade['pl_pct']:+.1f}%  [{RESULT_LABELS.get(trade['result'], trade['result'])}]"
+                    ), font=dict(color=ex_color, size=14)),
+                    xaxis_title="日付", yaxis_title="価格 ($)",
+                    yaxis_tickprefix="$",
+                    xaxis_rangeslider_visible=False,
+                    hovermode="x unified", height=580,
+                    legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.6)"),
+                )
+                st.plotly_chart(fig_c, use_container_width=True)
+                col_d1, col_d2, col_d3, col_d4, col_d5 = st.columns(5)
+                sl_dist = (trade["entry_price"] - trade["sl_price"]) / trade["entry_price"] * 100
+                col_d1.metric("Entry",    f"${trade['entry_price']:.2f}")
+                col_d2.metric("Exit",     f"${trade['exit_price']:.2f}", f"{trade['pl_pct']:+.1f}%")
+                col_d3.metric("SL",       f"${trade['sl_price']:.2f}",  f"距離 {sl_dist:.1f}%", delta_color="inverse")
+                col_d4.metric("ATR推定",  f"${trade['atr']:.2f}")
+                col_d5.metric("保有日数", f"{hold_days}日")
