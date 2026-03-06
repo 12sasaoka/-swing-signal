@@ -768,7 +768,7 @@ def load_raw_trades_for_chart(csv_file: str):
 @st.cache_data(ttl=3600)
 def fetch_chart_prices(ticker: str, entry_date: str, exit_date: str):
     s = (pd.Timestamp(entry_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
-    e = (pd.Timestamp(exit_date)  + pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    e = (pd.Timestamp(exit_date)  + pd.Timedelta(days=100)).strftime("%Y-%m-%d")
     df_p = yf.download(ticker, start=s, end=e, auto_adjust=True, progress=False)
     if isinstance(df_p.columns, pd.MultiIndex):
         df_p.columns = df_p.columns.get_level_values(0)
@@ -780,8 +780,8 @@ def make_trade_chart(trade: dict, df_p: pd.DataFrame, height: int = 320) -> go.F
     entry_dt = pd.Timestamp(trade["entry_date"])
     exit_dt  = pd.Timestamp(trade["exit_date"])
     mask = (
-        (df_p.index >= entry_dt - pd.Timedelta(days=35)) &
-        (df_p.index <= exit_dt  + pd.Timedelta(days=7))
+        (df_p.index >= entry_dt - pd.Timedelta(days=45)) &
+        (df_p.index <= exit_dt  + pd.Timedelta(days=75))
     )
     plot_df = df_p[mask]
     if plot_df.empty:
