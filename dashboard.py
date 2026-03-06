@@ -293,8 +293,8 @@ c6.metric("Calmar",    f"{calmar_etf:.2f}",    f"Base: {calmar_base:.2f}")
 st.divider()
 
 # ── タブ ─────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["📈 資産推移", "🗂 資本配分", "📅 年別", "📋 取引一覧", "📊 サマリー", "📉 チャート確認"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["📈 資産推移", "🗂 資本配分", "📅 年別", "📋 取引一覧", "📊 サマリー", "📉 チャート確認", "🔔 ストップ管理"]
 )
 
 # ── Tab 1: 資産推移 ───────────────────────────────────────────────
@@ -909,3 +909,142 @@ with tab6:
                             st.warning(f"{trade['ticker']}: 表示範囲なし")
                     else:
                         st.warning(f"{trade['ticker']}: データ取得失敗")
+
+
+# ── Tab 7: ストップ注文管理 (Option A) ──────────────────────────────────
+def _calc_trail_level(entry_price, sl_price, signal, df_prices, holding_days):
+    atr = (entry_price - sl_price) / 2.0 if entry_price > sl_price else 0.01
+    if df_prices.empty:
+        return sl_price, atr
+    highest_high = float(df_prices["High"].max())
+    peak_profit_atr = (highest_high - entry_price) / atr if atr > 0 else 0.0
+
+    if signal == "STRONG_BUY":
+        trail_mult = 4.0
+    else:
+        trail_mult = 3.5
+        for min_atr, mult in [(6.0, 2.0), (4.0, 2.5), (2.0, 3.0)]:
+            if peak_profit_atr >= min_atr:
+                trail_mult = mult
+                break
+
+    trail_atr  = highest_high - atr * trail_mult
+    pct_room   = max(0.05, 1.5 * atr / highest_high) if highest_high > 0 else 0.05
+    trail_peak = highest_high * (1.0 - pct_room)
+    trail      = max(trail_atr, trail_peak)
+
+    if peak_profit_atr >= 1.0:
+        trail = max(trail, entry_price + atr)
+
+    return trail, atr
+
+
+with tab7:
+    st.subheader("毎朝ストップ注文 管理")
+    st.caption(
+        "毎朝マーケットオープン前にこのタブを確認し、"
+        "**🎯 本日ストップ $** の価格でストップ注文を設定してください。"
+        "  |  計算ロジックはバックテストエンジンと同一です。"
+    )
+
+    if "stop_positions" not in st.session_state:
+        st.session_state["stop_positions"] = []
+
+    with st.expander(
+        "➕ ポジションを追加",
+        expanded=(len(st.session_state["stop_positions"]) == 0),
+    ):
+        with st.form("add_pos_form", clear_on_submit=True):
+            c1, c2, c3, c4, c5 = st.columns(5)
+            new_ticker   = c1.text_input("Ticker", placeholder="AAPL")
+            new_signal   = c2.selectbox("シグナル", ["BUY", "STRONG_BUY"])
+            new_entry_dt = c3.text_input("エントリー日", placeholder="2026-03-01")
+            new_entry_px = c4.number_input("エントリー価格 $", min_value=0.01, value=100.0, step=0.01, format="%.2f")
+            new_sl_px    = c5.number_input("SL価格 $", min_value=0.01, value=95.0, step=0.01, format="%.2f")
+            if st.form_submit_button("追加"):
+                t = new_ticker.strip().upper()
+                if t and new_entry_dt.strip():
+                    st.session_state["stop_positions"].append({
+                        "ticker":      t,
+                        "signal":      new_signal,
+                        "entry_date":  new_entry_dt.strip(),
+                        "entry_price": new_entry_px,
+                        "sl_price":    new_sl_px,
+                    })
+                    st.rerun()
+
+    positions = st.session_state["stop_positions"]
+
+    if not positions:
+        st.info("上の「ポジションを追加」から保有ポジションを入力してください。")
+    else:
+        today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
+
+        rows = []
+        with st.spinner("最新価格データを取得中..."):
+            for i, pos in enumerate(positions):
+                try:
+                    start = (pd.Timestamp(pos["entry_date"]) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                    df_p  = yf.download(pos["ticker"], start=start, end=today_str,
+                                        auto_adjust=True, progress=False)
+                    if isinstance(df_p.columns, pd.MultiIndex):
+                        df_p.columns = df_p.columns.get_level_values(0)
+
+                    if df_p.empty:
+                        current_px, holding_d = None, 0
+                        trail_lv, atr = pos["sl_price"], (pos["entry_price"] - pos["sl_price"]) / 2.0
+                    else:
+                        current_px  = float(df_p["Close"].iloc[-1])
+                        holding_d   = max(0, (df_p.index[-1] - pd.Timestamp(pos["entry_date"])).days)
+                        trail_lv, atr = _calc_trail_level(
+                            pos["entry_price"], pos["sl_price"],
+                            pos["signal"], df_p, holding_d,
+                        )
+                except Exception:
+                    current_px, holding_d = None, 0
+                    trail_lv, atr = pos["sl_price"], (pos["entry_price"] - pos["sl_price"]) / 2.0
+
+                be_lv    = pos["entry_price"] + atr
+                pnl_pct  = (current_px - pos["entry_price"]) / pos["entry_price"] * 100 if current_px else 0.0
+                stop_pnl = (trail_lv - pos["entry_price"]) / pos["entry_price"] * 100
+
+                rows.append({
+                    "_idx":       i,
+                    "Ticker":     pos["ticker"],
+                    "Signal":     pos["signal"],
+                    "Entry日":    pos["entry_date"],
+                    "保有日数":   f"{holding_d}d",
+                    "Entry $":    f"${pos['entry_price']:.2f}",
+                    "現在値 $":   f"${current_px:.2f}" if current_px else "—",
+                    "損益":       f"{pnl_pct:+.1f}%" if current_px else "—",
+                    "SL $":       f"${pos['sl_price']:.2f}",
+                    "BE水準 $":   f"${be_lv:.2f}",
+                    "🎯 本日ストップ $": f"${trail_lv:.2f}",
+                    "ストップ損益": f"{stop_pnl:+.1f}%",
+                })
+
+        st.markdown("### 本日のストップ注文水準")
+        display_df = pd.DataFrame([{k: v for k, v in r.items() if k != "_idx"} for r in rows])
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("**ポジションを削除**")
+        to_delete = None
+        del_cols = st.columns(min(len(positions), 8))
+        for j, pos in enumerate(positions):
+            with del_cols[j % 8]:
+                if st.button(f"x {pos['ticker']}", key=f"del7_{j}"):
+                    to_delete = j
+        if to_delete is not None:
+            st.session_state["stop_positions"].pop(to_delete)
+            st.rerun()
+
+        st.markdown("---")
+        st.caption(
+            "**計算ルール（バックテスト準拠）**:  "
+            "ATR = (entry - SL) ÷ 2  |  "
+            "Trail = max(最高値 - ATR × 倍率, 最高値 × 95%)  |  "
+            "BEロック: 含み益 ≥ 1ATR で trail ≥ entry + ATR  |  "
+            "BUY倍率: 3.5→3.0(2ATR)→2.5(4ATR)→2.0(6ATR)  |  "
+            "STRONG_BUY倍率: 4.0固定"
+        )
