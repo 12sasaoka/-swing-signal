@@ -761,11 +761,6 @@ def load_raw_trades_for_chart(csv_file: str):
                 "result":      row["result"],
                 "atr":         atr,
                 "be_level":    entry + atr,
-                "label": (
-                    f"{row['ticker']}  "
-                    f"{row['entry_date']}->{row['exit_date']}  "
-                    f"{pl:+.1f}%  [{row['result']}]"
-                ),
             })
     return rows
 
@@ -780,10 +775,75 @@ def fetch_chart_prices(ticker: str, entry_date: str, exit_date: str):
     return df_p
 
 
+def make_trade_chart(trade: dict, df_p: pd.DataFrame, height: int = 320) -> go.Figure:
+    """1トレード分の小チャートを生成。"""
+    entry_dt = pd.Timestamp(trade["entry_date"])
+    exit_dt  = pd.Timestamp(trade["exit_date"])
+    mask = (
+        (df_p.index >= entry_dt - pd.Timedelta(days=35)) &
+        (df_p.index <= exit_dt  + pd.Timedelta(days=7))
+    )
+    plot_df = df_p[mask]
+    if plot_df.empty:
+        return None
+    ex_color  = "#7ee787" if trade["pl_pct"] > 0 else "#f85149"
+    hold_days = (exit_dt - entry_dt).days
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=plot_df.index,
+        open=plot_df["Open"], high=plot_df["High"],
+        low=plot_df["Low"],   close=plot_df["Close"],
+        name="価格",
+        increasing_line_color="#3fb950",
+        decreasing_line_color="#f85149",
+        showlegend=False,
+    ))
+    fig.add_hline(y=trade["sl_price"], line_dash="dash", line_color="#f85149", line_width=1)
+    fig.add_hline(y=trade["be_level"], line_dash="dot",  line_color="#f0a500", line_width=1)
+    entry_rows = df_p[df_p.index >= entry_dt]
+    if not entry_rows.empty:
+        fig.add_trace(go.Scatter(
+            x=[entry_rows.index[0]],
+            y=[float(entry_rows.iloc[0]["Low"]) * 0.983],
+            mode="markers",
+            marker=dict(symbol="triangle-up", size=12, color="#3fb950"),
+            showlegend=False,
+        ))
+    exit_rows = df_p[df_p.index >= exit_dt]
+    if not exit_rows.empty:
+        fig.add_trace(go.Scatter(
+            x=[exit_rows.index[0]],
+            y=[float(exit_rows.iloc[0]["High"]) * 1.017],
+            mode="markers",
+            marker=dict(symbol='triangle-down', size=12, color=ex_color),
+            showlegend=False,
+        ))
+    fig.add_vline(x=entry_dt.timestamp()*1000, line_dash="dot", line_color="#3fb950", line_width=1, opacity=0.35)
+    fig.add_vline(x=exit_dt.timestamp()*1000,  line_dash="dot", line_color=ex_color, line_width=1, opacity=0.35)
+    result_label = RESULT_LABELS.get(trade["result"], trade["result"])
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{trade['ticker']}</b>  {trade['signal'][:2]}  {trade['pl_pct']:+.1f}%  {result_label}  {hold_days}d",
+            font=dict(color=ex_color, size=11),
+            x=0.02, y=0.97, xanchor='left', yanchor='top',
+        ),
+        xaxis=dict(showticklabels=False, showgrid=False, rangeslider_visible=False),
+        yaxis=dict(tickprefix="$", tickfont=dict(size=9), showgrid=True, gridcolor="#21262d"),
+        margin=dict(l=45, r=8, t=30, b=8),
+        height=height,
+        plot_bgcolor="#161b22",
+        paper_bgcolor="#0d1117",
+        showlegend=False,
+    )
+    return fig
+
+
 with tab6:
-    st.subheader("個別トレード チャート確認")
-    st.caption("エントリー前30日～エグジット後7日のローソク足。△=エントリー、▽=エグジット、赤破線=SL、橙点線=BEロック水準(entry+1ATR)")
+    st.subheader("トレード チャート一覧")
+    st.caption("△=エントリー  ▽=エグジット  赤破線=SL  橙点線=BEロック水準(entry+1ATR)")
     raw_trades = load_raw_trades_for_chart(selected_csv)
+
+    # ── フィルター ──
     col_t6a, col_t6b, col_t6c, col_t6d = st.columns(4)
     with col_t6a:
         res_opts = ["全件"] + sorted(set(t["result"] for t in raw_trades))
@@ -795,6 +855,7 @@ with tab6:
         yr_f = st.selectbox("年", yr_opts, key="t6_yr")
     with col_t6d:
         pl_f = st.selectbox("損益", ["全件", "利確(+)", "損切(-)"], key="t6_pl")
+
     filtered = raw_trades
     if res_f != "全件":
         filtered = [t for t in filtered if t["result"] == res_f]
@@ -806,87 +867,45 @@ with tab6:
         filtered = [t for t in filtered if t["pl_pct"] > 0]
     elif pl_f == "損切(-)":
         filtered = [t for t in filtered if t["pl_pct"] <= 0]
-    filtered_sorted = sorted(filtered, key=lambda t: t["pl_pct"], reverse=True)
-    st.caption(f"{len(filtered_sorted)} 件該当")
-    if not filtered_sorted:
+
+    sort_opts = ["損益順（高い順）", "損益順（低い順）", "日付順（新しい順）", "日付順（古い順）"]
+    col_s1, col_s2 = st.columns([2, 4])
+    with col_s1:
+        sort_by = st.selectbox("並び順", sort_opts, key="t6_sort")
+    with col_s2:
+        max_show = st.slider("表示件数", min_value=4, max_value=60, value=20, step=4, key="t6_max")
+
+    if sort_by == "損益順（高い順）":
+        filtered_sorted = sorted(filtered, key=lambda t: t["pl_pct"], reverse=True)
+    elif sort_by == "損益順（低い順）":
+        filtered_sorted = sorted(filtered, key=lambda t: t["pl_pct"])
+    elif sort_by == "日付順（新しい順）":
+        filtered_sorted = sorted(filtered, key=lambda t: t["entry_date"], reverse=True)
+    else:
+        filtered_sorted = sorted(filtered, key=lambda t: t["entry_date"])
+
+    display_trades = filtered_sorted[:max_show]
+    st.caption(f"{len(filtered_sorted)} 件該当  /  先頭 {len(display_trades)} 件を表示")
+
+    if not display_trades:
         st.warning("該当する取引がありません。")
     else:
-        labels = [t["label"] for t in filtered_sorted]
-        selected_label = st.selectbox("取引を選択（損益順）", labels, key="t6_trade")
-        trade = next(t for t in filtered_sorted if t["label"] == selected_label)
-        with st.spinner(f"{trade['ticker']} の価格データ取得中..."):
-            df_p = fetch_chart_prices(trade["ticker"], trade["entry_date"], trade["exit_date"])
-        if df_p.empty:
-            st.error("価格データが取得できませんでした。")
-        else:
-            entry_dt  = pd.Timestamp(trade["entry_date"])
-            exit_dt   = pd.Timestamp(trade["exit_date"])
-            mask = (
-                (df_p.index >= entry_dt - pd.Timedelta(days=35)) &
-                (df_p.index <= exit_dt  + pd.Timedelta(days=7))
-            )
-            plot_df = df_p[mask]
-            if plot_df.empty:
-                st.error("表示範囲のデータがありません。")
-            else:
-                ex_color  = "#7ee787" if trade["pl_pct"] > 0 else "#f85149"
-                hold_days = (exit_dt - entry_dt).days
-                fig_c = go.Figure()
-                fig_c.add_trace(go.Candlestick(
-                    x=plot_df.index,
-                    open=plot_df["Open"], high=plot_df["High"],
-                    low=plot_df["Low"],   close=plot_df["Close"],
-                    name="価格",
-                    increasing_line_color="#3fb950",
-                    decreasing_line_color="#f85149",
-                ))
-                fig_c.add_hline(y=trade["sl_price"], line_dash="dash", line_color="#f85149", line_width=1.5,
-                    annotation_text=f"SL ${trade['sl_price']:.2f}",
-                    annotation_position="left", annotation_font_color="#f85149")
-                fig_c.add_hline(y=trade["be_level"], line_dash="dot", line_color="#f0a500", line_width=1.5,
-                    annotation_text=f"BE ${trade['be_level']:.2f}",
-                    annotation_position="left", annotation_font_color="#f0a500")
-                entry_rows = df_p[df_p.index >= entry_dt]
-                if not entry_rows.empty:
-                    fig_c.add_trace(go.Scatter(
-                        x=[entry_rows.index[0]],
-                        y=[float(entry_rows.iloc[0]["Low"]) * 0.985],
-                        mode="markers+text",
-                        marker=dict(symbol="triangle-up", size=16, color="#3fb950"),
-                        text=["BUY"], textposition="bottom center",
-                        textfont=dict(color="#3fb950", size=12),
-                        name=f"Entry ${trade['entry_price']:.2f}",
-                    ))
-                exit_rows = df_p[df_p.index >= exit_dt]
-                if not exit_rows.empty:
-                    fig_c.add_trace(go.Scatter(
-                        x=[exit_rows.index[0]],
-                        y=[float(exit_rows.iloc[0]["High"]) * 1.015],
-                        mode="markers+text",
-                        marker=dict(symbol='triangle-down', size=16, color=ex_color),
-                        text=[f"{trade['pl_pct']:+.1f}%"], textposition="top center",
-                        textfont=dict(color=ex_color, size=12),
-                        name=f"Exit ${trade['exit_price']:.2f}  ({trade['pl_pct']:+.1f}%)",
-                    ))
-                fig_c.add_vline(x=entry_dt.timestamp()*1000, line_dash="dot", line_color="#3fb950", line_width=1, opacity=0.4)
-                fig_c.add_vline(x=exit_dt.timestamp()*1000,  line_dash="dot", line_color=ex_color, line_width=1, opacity=0.4)
-                fig_c.update_layout(
-                    title=dict(text=(
-                        f"{trade['ticker']}  {trade['signal']}  |  "
-                        f"{trade['entry_date']} -> {trade['exit_date']}  ({hold_days}日保有)  |  "
-                        f"P/L: {trade['pl_pct']:+.1f}%  [{RESULT_LABELS.get(trade['result'], trade['result'])}]"
-                    ), font=dict(color=ex_color, size=14)),
-                    xaxis_title="日付", yaxis_title="価格 ($)",
-                    yaxis_tickprefix="$",
-                    xaxis_rangeslider_visible=False,
-                    hovermode="x unified", height=580,
-                    legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.6)"),
-                )
-                st.plotly_chart(fig_c, use_container_width=True)
-                col_d1, col_d2, col_d3, col_d4, col_d5 = st.columns(5)
-                sl_dist = (trade["entry_price"] - trade["sl_price"]) / trade["entry_price"] * 100
-                col_d1.metric("Entry",    f"${trade['entry_price']:.2f}")
-                col_d2.metric("Exit",     f"${trade['exit_price']:.2f}", f"{trade['pl_pct']:+.1f}%")
-                col_d3.metric("SL",       f"${trade['sl_price']:.2f}",  f"距離 {sl_dist:.1f}%", delta_color="inverse")
-                col_d4.metric("ATR推定",  f"${trade['atr']:.2f}")
-                col_d5.metric("保有日数", f"{hold_days}日")
+        with st.spinner("チャートデータ取得中..."):
+            chart_data = []
+            for trade in display_trades:
+                df_p = fetch_chart_prices(trade["ticker"], trade["entry_date"], trade["exit_date"])
+                chart_data.append((trade, df_p))
+
+        # 2列グリッドで表示
+        for i in range(0, len(chart_data), 2):
+            col_left, col_right = st.columns(2)
+            for col, (trade, df_p) in zip([col_left, col_right], chart_data[i:i+2]):
+                with col:
+                    if df_p is not None and not df_p.empty:
+                        fig = make_trade_chart(trade, df_p, height=320)
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.warning(f"{trade['ticker']}: 表示範囲なし")
+                    else:
+                        st.warning(f"{trade['ticker']}: データ取得失敗")
