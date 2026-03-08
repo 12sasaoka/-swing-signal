@@ -33,3 +33,4 @@ output/results/
 # 一時ファイル
 _ul*
 *.log
+output/backtest/*.txt
