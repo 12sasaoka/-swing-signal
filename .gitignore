@@ -22,8 +22,13 @@ data/db/*.db
 data/db/price_cache/
 data/db/earnings_cache.json
 
-# バックテスト出力（最新以外は除外してもよい）
-# output/backtest/*.csv
+# バックテスト出力（実験CSV/チャートは除外）
+output/backtest/*.csv
+output/backtest/*.png
+output/results/
+
+# Claude Code 設定（ローカル専用）
+.claude/settings.local.json
 
 # 一時ファイル
 _ul*

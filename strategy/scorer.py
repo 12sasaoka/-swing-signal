@@ -29,6 +29,7 @@ import pandas as pd
 from analysis.momentum import calc_momentum_score,calc_momentum_detail
 from analysis.quality import calc_quality_score
 from analysis.sentiment import calc_sentiment_score
+from analysis.technical_quality import calc_technical_quality_score
 from analysis.value import calc_value_score
 import config.settings as _cfg
 from config.settings import SIGNAL_THRESHOLDS
@@ -146,11 +147,17 @@ def score_ticker(
         )
 
         # ---- 2. Claude API スコアで上書き（フルモード時） ----
+        # sentiment_available: ニュース情報が実際に存在するかを示すフラグ
+        # True  → Mom×0.50 + Q×0.30 + S×0.20 で計算
+        # False → S枠を M/Q に比例配分: Mom×0.625 + Q×0.375
         if claude_score is not None:
             result.claude_score = claude_score
             sentiment_for_composite = claude_score
+            sentiment_available = True   # Claude がスコアを返した = ニュースあり
         else:
             sentiment_for_composite = result.sentiment_score
+            # キーワードベース: headlines が空でなければニュースあり扱い
+            sentiment_available = bool(headlines)
 
         # ---- 3. 統合スコア ----
         result.final_score = _calc_composite(
@@ -158,6 +165,7 @@ def score_ticker(
             result.value_score,
             result.quality_score,
             sentiment_for_composite,
+            sentiment_available=sentiment_available,
         )
 
         # ---- 4. シグナル判定 ----
@@ -266,18 +274,28 @@ def _calc_composite(
     value: float,
     quality: float,
     sentiment: float,
+    sentiment_available: bool = True,
 ) -> float:
     """4ファクターの加重平均を算出する。
 
-    composite = M*w_m + V*w_v + Q*w_q + S*w_s
+    sentiment_available=False のとき、sentimentウェイト(20%)を
+    MomentumとQualityに比例配分して再正規化する。
+      通常:       Mom×0.50 + Q×0.30 + S×0.20
+      ニュースなし: Mom×0.625 + Q×0.375 (比率を維持したまま100%に引き伸ばし)
     """
     w = _cfg.FACTOR_WEIGHTS
-    composite = (
-        momentum * w.momentum
-        + value * w.value
-        + quality * w.quality
-        + sentiment * w.sentiment
-    )
+    if not sentiment_available:
+        mq_total = w.momentum + w.quality  # 0.80
+        m_w = w.momentum / mq_total        # 0.625
+        q_w = w.quality  / mq_total        # 0.375
+        composite = momentum * m_w + value * w.value + quality * q_w
+    else:
+        composite = (
+            momentum * w.momentum
+            + value * w.value
+            + quality * w.quality
+            + sentiment * w.sentiment
+        )
     return float(np.clip(composite, -1.0, 1.0))
 
 

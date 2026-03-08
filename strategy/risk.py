@@ -158,7 +158,7 @@ def calc_atr(
         tr3 = (prev_close - low).abs()
 
         true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr_series = true_range.rolling(window=period).mean()
+        atr_series = true_range.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
 
         atr_value = atr_series.iloc[-1]
         if np.isnan(atr_value):

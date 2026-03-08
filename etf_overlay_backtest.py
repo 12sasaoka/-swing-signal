@@ -34,7 +34,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # ── パラメータ ──────────────────────────────────────────────────────
 BASE   = Path(__file__).resolve().parent
-CSV_IN = BASE / "output/backtest/signal_backtest_20260303_022802_sb_trail4.0.csv"
+CSV_IN = BASE / "output/backtest/signal_backtest_20260305_223046_sb_trail4.0.csv"
 
 INITIAL      = 4000.0
 RISK         = 0.005
@@ -53,6 +53,20 @@ ETF_MA       = 50
 SPY_TREND_MA = 200
 SAFE_TICKER  = "SGOV"
 REBAL_FREQ   = "weekly"   # "monthly" / "weekly" / "daily"
+
+# ── Case A: レバレッジETF追加 ──────────────────────────────────────
+# QLD = NASDAQ 2x, SSO = S&P500 2x
+# True にするとユニバースに追加してモメンタム選択に含める
+USE_LEVERAGE_ETF: bool = False
+LEVERAGE_ETF_UNIVERSE = ["QLD", "SSO"]
+
+# ── Case C: ベア相場インバースETF ─────────────────────────────────
+# SPY < 200MA 時に SGOV の代わりに一部をインバースETFに投資
+# SH = S&P500 -1x（3x は減価リスクが大きいため -1x を使用）
+# True にするとベア時に待機資金の50%をインバース、50%をSGOVに配分
+USE_BEAR_ETF: bool = False
+BEAR_ETF = "SH"
+BEAR_ETF_ALLOC = 0.5   # ベア時の待機資金のうちインバースETFに配分する割合
 
 MOMENTUM_PERIODS = {
     "1M":  (21,  0.30),
@@ -93,7 +107,16 @@ for i, t in enumerate(trades_raw):
 
 
 # ── ETFデータ取得 ──────────────────────────────────────────────────
-tickers_dl = ETF_UNIVERSE + [SAFE_TICKER]
+# 有効なユニバース（フラグに応じて拡張）
+_active_universe = ETF_UNIVERSE.copy()
+if USE_LEVERAGE_ETF:
+    _active_universe += LEVERAGE_ETF_UNIVERSE
+
+_extra_tickers = [SAFE_TICKER]
+if USE_BEAR_ETF:
+    _extra_tickers.append(BEAR_ETF)
+
+tickers_dl = _active_universe + _extra_tickers
 print(f"ETFデータ取得中（{len(tickers_dl)}本）...")
 raw_all = yf.download(tickers_dl, start=DATA_START, end=SIM_END,
                       auto_adjust=True, progress=False)
@@ -136,7 +159,7 @@ def spy_regime(date: pd.Timestamp) -> bool:
 
 def calc_momentum_scores(date: pd.Timestamp) -> list[tuple[str, float]]:
     rets: dict[str, dict[str, float]] = {}
-    for ticker in ETF_UNIVERSE:
+    for ticker in _active_universe:
         s = etf_close.get(ticker)
         if s is None: continue
         past = s[s.index <= date]
@@ -221,40 +244,67 @@ def run_simulation(with_etf: bool) -> tuple[pd.DataFrame, list[dict], float]:
                             etf_pos[tk] = etf_pos.get(tk, 0.0) + alloc_each / p
                             cash -= alloc_each
             else:
+                # ベア相場: セクターETFを全売却
+                _bear_safe = [SAFE_TICKER] + ([BEAR_ETF] if USE_BEAR_ETF else [])
                 for tk in list(etf_pos.keys()):
-                    if tk != SAFE_TICKER:
+                    if tk not in _bear_safe:
                         p = etf_price(tk, date)
                         if p: cash += etf_pos[tk] * p
                         del etf_pos[tk]
-                sgov_p = etf_price(SAFE_TICKER, date)
-                if sgov_p and cash > 1.0:
-                    etf_pos[SAFE_TICKER] = etf_pos.get(SAFE_TICKER, 0.0) + cash / sgov_p
-                    cash = 0.0
+                if cash > 1.0:
+                    if USE_BEAR_ETF:
+                        # Case C: 待機資金の BEAR_ETF_ALLOC をインバースETFへ、残りを SGOV へ
+                        bear_p  = etf_price(BEAR_ETF, date)
+                        sgov_p  = etf_price(SAFE_TICKER, date)
+                        if bear_p and sgov_p:
+                            bear_cash = cash * BEAR_ETF_ALLOC
+                            sgov_cash = cash * (1.0 - BEAR_ETF_ALLOC)
+                            etf_pos[BEAR_ETF]    = etf_pos.get(BEAR_ETF, 0.0)    + bear_cash / bear_p
+                            etf_pos[SAFE_TICKER] = etf_pos.get(SAFE_TICKER, 0.0) + sgov_cash / sgov_p
+                            cash = 0.0
+                    else:
+                        sgov_p = etf_price(SAFE_TICKER, date)
+                        if sgov_p:
+                            etf_pos[SAFE_TICKER] = etf_pos.get(SAFE_TICKER, 0.0) + cash / sgov_p
+                            cash = 0.0
 
         # ─── ② 日次: レジーム変化 + 50MA割れ ──────────────────────
+        _bear_holdings = [SAFE_TICKER] + ([BEAR_ETF] if USE_BEAR_ETF else [])
         if with_etf:
             if reg_chg and not bull:
-                sgov_p = etf_price(SAFE_TICKER, date)
+                # ブル→ベア: セクターETFを全売却してベア待避ポジへ
                 for tk in list(etf_pos.keys()):
-                    if tk != SAFE_TICKER:
+                    if tk not in _bear_holdings:
                         p = etf_price(tk, date)
                         if p: cash += etf_pos[tk] * p
                         del etf_pos[tk]
-                if sgov_p and cash > 1.0:
-                    etf_pos[SAFE_TICKER] = etf_pos.get(SAFE_TICKER, 0.0) + cash / sgov_p
-                    cash = 0.0
+                if cash > 1.0:
+                    if USE_BEAR_ETF:
+                        bear_p = etf_price(BEAR_ETF, date)
+                        sgov_p = etf_price(SAFE_TICKER, date)
+                        if bear_p and sgov_p:
+                            etf_pos[BEAR_ETF]    = etf_pos.get(BEAR_ETF, 0.0)    + cash * BEAR_ETF_ALLOC / bear_p
+                            etf_pos[SAFE_TICKER] = etf_pos.get(SAFE_TICKER, 0.0) + cash * (1 - BEAR_ETF_ALLOC) / sgov_p
+                            cash = 0.0
+                    else:
+                        sgov_p = etf_price(SAFE_TICKER, date)
+                        if sgov_p and cash > 1.0:
+                            etf_pos[SAFE_TICKER] = etf_pos.get(SAFE_TICKER, 0.0) + cash / sgov_p
+                            cash = 0.0
             elif reg_chg and bull:
-                if SAFE_TICKER in etf_pos:
-                    p = etf_price(SAFE_TICKER, date)
-                    if p: cash += etf_pos[SAFE_TICKER] * p
-                    del etf_pos[SAFE_TICKER]
+                # ベア→ブル: ベア待避ポジを全売却してブル態勢へ
+                for tk in _bear_holdings:
+                    if tk in etf_pos:
+                        p = etf_price(tk, date)
+                        if p: cash += etf_pos[tk] * p
+                        del etf_pos[tk]
                 for tk in list(etf_pos.keys()):
                     p = etf_price(tk, date); ma = etf_ma(tk, date)
                     if p and ma and p < ma:
                         cash += etf_pos[tk] * p; del etf_pos[tk]
             elif bull:
                 for tk in list(etf_pos.keys()):
-                    if tk == SAFE_TICKER: continue
+                    if tk in _bear_holdings: continue
                     p = etf_price(tk, date); ma = etf_ma(tk, date)
                     if p and ma and p < ma:
                         cash += etf_pos[tk] * p; del etf_pos[tk]

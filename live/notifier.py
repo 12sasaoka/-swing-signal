@@ -39,12 +39,14 @@ def send_daily_notification(
     final_balance: float,
     total_return_pct: float,
     today: str,
+    etf_orders: list[dict] | None = None,
 ) -> bool:
     """日次ポートフォリオ更新を LINE Notify で送信する。"""
     message = _build_message(
         exits, entries, state, spy_filter,
         spy_close, spy_ma200,
         final_balance, total_return_pct, today,
+        etf_orders=etf_orders,
     )
     return notify_custom(message)
 
@@ -59,6 +61,7 @@ def _build_message(
     final_balance: float,
     total_return_pct: float,
     today: str,
+    etf_orders: list[dict] | None = None,
 ) -> str:
     from backtest.engine import MAX_CONCURRENT_POSITIONS
 
@@ -103,6 +106,16 @@ def _build_message(
         lines.append("\n🟢 ENTRY: 弱気相場のためスキップ")
     else:
         lines.append("\n🟢 ENTRY: シグナルなし")
+
+    # ETFオーダー
+    if etf_orders:
+        buys  = [o for o in etf_orders if o["action"] == "BUY"]
+        sells = [o for o in etf_orders if o["action"] == "SELL"]
+        lines.append(f"\n📊 ETF ({len(etf_orders)}件)")
+        for o in sells[:4]:
+            lines.append(f"  SELL {o['ticker']:<5} ${o['value']:.0f}  [{o['reason']}]")
+        for o in buys[:4]:
+            lines.append(f"  BUY  {o['ticker']:<5} ${o['value']:.0f}  [{o['reason']}]")
 
     # ポートフォリオサマリー
     sign = "+" if total_return_pct >= 0 else ""

@@ -35,7 +35,7 @@ class TradeRules:
 
     max_position_pct: float = 0.05          # 1銘柄最大ポジション (5%)
     max_sector_pct: float = 0.25            # 1セクター最大ポジション (25%)
-    hard_stop_loss_pct: float = -0.06       # ハードストップ損切り (-6%) 【案2: りおぽん -5%ルール準拠】
+    hard_stop_loss_pct: float = -0.06       # ハードストップ損切り (-6%)
     hard_take_profit_pct: float = 0.20      # ハード利確 (+20%)
     buy_threshold: float = 0.7              # BUYシグナル閾値 (スコア ≥ 0.7)
     sell_threshold: float = -0.3            # SELLシグナル閾値 (スコア ≤ -0.3)
@@ -65,10 +65,10 @@ class SignalThresholds:
 class FactorWeights:
     """4ファクターの統合ウェイト（合計 1.0）。"""
 
-    momentum: float = 0.50
+    momentum: float = 0.65
     value: float = 0.00
-    quality: float = 0.30
-    sentiment: float = 0.20
+    quality: float = 0.35
+    sentiment: float = 0.00
 
     def __post_init__(self) -> None:
         total = self.momentum + self.value + self.quality + self.sentiment

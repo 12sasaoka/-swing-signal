@@ -148,35 +148,24 @@ def analyze_ticker(
     headlines: list[str],
     ticker: str = "",
 ) -> dict[str, Any]:
-    """1銘柄の決算 + ニュースを統合分析する。
+    """1銘柄のニュースセンチメントを Claude で分析する。
 
-    combined_score = earnings_score * 0.7 + news_score * 0.3
+    combined_score = news_score × 1.0
+    （earnings分析は Quality ファクターと重複するため省略）
 
     Args:
-        fundamentals: ファンダメンタル指標の辞書。
+        fundamentals: 未使用（インターフェース互換のため残存）
         headlines:    ニュースヘッドラインのリスト。
         ticker: ティッカーシンボル（プロンプトの文脈情報として使用）。
 
     Returns:
         統合分析結果:
-            - combined_score (float): 統合スコア (-1.0 〜 +1.0)
-            - earnings (dict):        決算分析結果
+            - combined_score (float): ニューススコア (-1.0 〜 +1.0)
             - news (dict):            ニュース分析結果
     """
-    earnings_result = analyze_earnings(fundamentals, ticker)
     news_result = analyze_news(headlines, ticker)
-
-    e_weight = CLAUDE_API_CONFIG.earnings_weight
-    n_weight = CLAUDE_API_CONFIG.news_weight
-    combined = (
-        earnings_result["score"] * e_weight
-        + news_result["score"] * n_weight
-    )
-    combined = max(-1.0, min(1.0, combined))
-
     return {
-        "combined_score": combined,
-        "earnings": earnings_result,
+        "combined_score": news_result["score"],
         "news": news_result,
     }
 

@@ -43,6 +43,12 @@ RESULT_LABELS = {
     "riopon_20d":    "Riopon-1M",
     "riopon_40d":    "Riopon-2M",
     "riopon_60d":    "Riopon-3M",
+    # 部分利確ラベル
+    "partial_sl":    "Part+SL",
+    "partial_trail": "Part+Trail",
+    "partial_to30d": "Part+TO30",
+    "partial_to60d": "Part+TO60",
+    "partial_to90d": "Part+TO90",
 }
 
 
