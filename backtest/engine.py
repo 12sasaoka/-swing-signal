@@ -71,6 +71,8 @@ def _compute_phase1_cache_key(tickers: list, has_quarterly: bool) -> str:
         str(DIP_FILTER_ENABLED),
         str(DIP_MIN_PCT),
         str(DIP_MAX_PCT),
+        str(BREAKOUT_FILTER_ENABLED),
+        str(BREAKOUT_THRESHOLD_PCT),
         str(TREND_STRENGTH_FILTER_ENABLED),
         str(TREND_STRENGTH_52W_MIN_RATIO),
         str(OVERBOUGHT_5D_THRESHOLD),
@@ -336,6 +338,17 @@ def _score_ticker_phase1(args):
                         from strategy.scorer import determine_signal as _det_sig_ob
                         result.signal = _det_sig_ob(result.final_score)
 
+            # ---- 案A: ブレイクアウトハードフィルター ----
+            # 直近N日高値の BREAKOUT_THRESHOLD_PCT 以内の銘柄のみ通過
+            # ディップ買いとは逆に「強さを確認してから乗る」設計
+            if BREAKOUT_FILTER_ENABLED and len(window_df) >= BREAKOUT_LOOKBACK:
+                _bo_high = float(window_df["Close"].iloc[-BREAKOUT_LOOKBACK:].max())
+                _bo_close = float(window_df["Close"].iloc[-1])
+                if _bo_high > 0:
+                    _bo_dip = (_bo_high - _bo_close) / _bo_high
+                    if _bo_dip > BREAKOUT_THRESHOLD_PCT:
+                        continue  # 20日高値から3%超下落中 → ブレイクアウトゾーン外 → スキップ
+
             # ---- 案1: ディップ買いスコアボーナス ----
             # りおぽん: 「直近高値から程よく引いた押し目で仕込む」
             # ※ハードフィルターではなくスコアボーナスに変更（機会損失を防ぐ）
@@ -462,7 +475,7 @@ PROGRESSIVE_TRAIL_LEVELS: list[tuple[float, float]] = [
 # ブレイクイーブン移動トリガー: 含み益がこの ATR 倍率以上で SL ≥ エントリー価格を保証
 BREAKEVEN_TRIGGER_ATR: float = 1.0
 # ブレイクイーブンラチェット: トリガー後のロック水準 = entry_price + atr × この値
-# 0.0 = 従来通り 0% ロック、0.5 = +0.5ATR（約+1〜2%）でロック
+# 0.0 = エントリー価格のみ（損失ゼロ保証）、1.0 = +1ATR（ベースライン）
 BREAKEVEN_LOCK_ATR: float = 1.0
 # BEロック最低保有日数: エントリーからこの営業日数未満ではBEロックを発動しない
 # 【Option A】検証済み: 大幅悪化 (+84.7% vs baseline +175.6%) のため事実上無効化
@@ -510,6 +523,13 @@ DIP_FILTER_ENABLED: bool = True
 DIP_LOOKBACK: int = 20          # 高値計算のルックバック（営業日）
 DIP_MIN_PCT: float = 0.03       # 最低3%下落（高値近辺はスキップ）
 DIP_MAX_PCT: float = 0.20       # 最大20%下落（急落すぎはスキップ）
+
+# 【案A: ブレイクアウトエントリーフィルター】
+# 検証済み(2026-03-09): DIPと置換するとETF込み+263.5%(vs baseline+288.3%) → 不採用
+# DIPと組み合わせる実験は今後の候補
+BREAKOUT_FILTER_ENABLED: bool = False
+BREAKOUT_LOOKBACK: int = 20        # 20日高値を基準
+BREAKOUT_THRESHOLD_PCT: float = 0.03  # 20日高値の3%以内のみ許可（ブレイクアウトゾーン）
 
 # 【Option C: 52週高値トレンド強度フィルター（ハードフィルター）】
 # 長期下降トレンドにある銘柄（52週高値から大きく下落した銘柄）を除外する
