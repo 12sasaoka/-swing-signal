@@ -292,9 +292,49 @@ c6.metric("Calmar",    f"{calmar_etf:.2f}",    f"Base: {calmar_base:.2f}")
 
 st.divider()
 
+# ── V2 データ読み込み ─────────────────────────────────────────────
+v2_daily_path  = CSV_DIR / "v2_lowrisk_daily.csv"
+v2_trades_path = CSV_DIR / "v2_etf_overlay_trades.csv"
+v2_available   = v2_daily_path.exists() and v2_trades_path.exists()
+
+if v2_available:
+    @st.cache_data(ttl=3600)
+    def load_v2_daily(p: str):
+        return pd.read_csv(p, parse_dates=["date"])
+
+    @st.cache_data(ttl=3600)
+    def load_v2_trades(p: str):
+        df_ = pd.read_csv(p)
+        return df_[df_["strategy"] == "V2-低リスク(+ETF)"].copy()
+
+    df_v2_d  = load_v2_daily(str(v2_daily_path))
+    df_v2_tr = load_v2_trades(str(v2_trades_path))
+
+    final_v2   = float(df_v2_d["equity"].iloc[-1])
+    ret_v2     = (final_v2 - INITIAL) / INITIAL * 100
+    arr_v2     = df_v2_d["equity"].values
+    peak_v2    = np.maximum.accumulate(arr_v2)
+    max_dd_v2  = float(((peak_v2 - arr_v2) / peak_v2 * 100).max())
+    r_v2       = df_v2_d.set_index("date")["equity"].pct_change().dropna()
+    sharpe_v2  = float(r_v2.mean() / r_v2.std() * np.sqrt(252)) if r_v2.std() > 0 else 0.0
+    yrs_v2     = (df_v2_d["date"].iloc[-1] - df_v2_d["date"].iloc[0]).days / 365.25
+    cagr_v2    = ((final_v2 / INITIAL) ** (1 / yrs_v2) - 1) * 100 if yrs_v2 > 0 else 0.0
+    calmar_v2  = ret_v2 / max_dd_v2 if max_dd_v2 > 0 else 0.0
+
+    # V2 年別リターン
+    yr_rets_v2: dict[int, float] = {}
+    prev_v = INITIAL
+    for yr_ in sorted(df_v2_d["date"].dt.year.unique()):
+        yd = df_v2_d[df_v2_d["date"].dt.year == yr_]
+        if yd.empty:
+            continue
+        end_v = float(yd["equity"].iloc[-1])
+        yr_rets_v2[yr_] = (end_v - prev_v) / prev_v * 100
+        prev_v = end_v
+
 # ── タブ ─────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["📈 資産推移", "🗂 資本配分", "📅 年別", "📋 取引一覧", "📊 サマリー", "📉 チャート確認", "🔔 ストップ管理"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+    ["📈 資産推移", "🗂 資本配分", "📅 年別", "📋 取引一覧", "📊 サマリー", "📉 チャート確認", "🔔 ストップ管理", "🚀 Strategy V2"]
 )
 
 # ── Tab 1: 資産推移 ───────────────────────────────────────────────
@@ -1048,3 +1088,161 @@ with tab7:
             "BUY倍率: 3.5→3.0(2ATR)→2.5(4ATR)→2.0(6ATR)  |  "
             "STRONG_BUY倍率: 4.0固定"
         )
+
+# ── Tab 8: Strategy V2 ────────────────────────────────────────────
+with tab8:
+    if not v2_available:
+        st.warning("V2データが見つかりません。`python strategy_v2/v2_etf_overlay.py` を実行してください。")
+    else:
+        st.subheader("Strategy V2 — ブレイクアウト + ETFオーバーレイ（低リスク）")
+        st.caption(
+            "bo_lb=189日高値ブレイク  |  trail=3.5×ATR  |  stop=8%  |  max_pos=3  |  "
+            "RISK=1.5%  MAX_ALLOC=20%  |  待機資金→ETFモメンタム（週次リバランス）"
+        )
+
+        # KPIカード
+        kc1, kc2, kc3, kc4, kc5, kc6 = st.columns(6)
+        kc1.metric("最終残高",  f"${final_v2:,.0f}",  f"Base: ${INITIAL:,.0f}")
+        kc2.metric("リターン",  f"{ret_v2:+.1f}%",    f"SPY: {spy_ret:+.1f}%")
+        kc3.metric("年率(CAGR)", f"{cagr_v2:+.1f}%",  "")
+        kc4.metric("最大DD",    f"{max_dd_v2:.1f}%",  "", delta_color="inverse")
+        kc5.metric("Sharpe",    f"{sharpe_v2:.3f}",   "")
+        kc6.metric("Calmar",    f"{calmar_v2:.2f}",   "")
+
+        st.divider()
+
+        # 資産推移チャート
+        fig_v2 = go.Figure()
+
+        fig_v2.add_trace(go.Scatter(
+            x=df_v2_d["date"], y=df_v2_d["equity"],
+            name=f"V2-低リスク(+ETF)  ${final_v2:,.0f}  ({ret_v2:+.1f}%)",
+            line=dict(color="#f0a500", width=2.5),
+            fill="tozeroy", fillcolor="rgba(240,165,0,0.06)",
+        ))
+        if etf_available:
+            fig_v2.add_trace(go.Scatter(
+                x=df_etf_d["date"], y=df_etf_d["balance"],
+                name=f"ベースライン ETF v2  ${final_etf:,.0f}  ({ret_etf:+.1f}%)",
+                line=dict(color="#7ee787", width=1.8, dash="dash"),
+            ))
+        fig_v2.add_trace(go.Scatter(
+            x=spy_norm.index, y=spy_norm.values,
+            name=f"SPY  ${spy_norm.iloc[-1]:,.0f}  ({spy_ret:+.1f}%)",
+            line=dict(color="#888888", width=1.3, dash="dot"),
+        ))
+        fig_v2.add_hline(y=INITIAL, line_dash="dot", line_color="#6e7681",
+                         annotation_text=f"${INITIAL:,.0f}", annotation_position="left")
+
+        # 年末アノテーション
+        for yr_ann, yr_ret_ann in yr_rets_v2.items():
+            yr_end = pd.Timestamp(f"{yr_ann}-12-31")
+            mask = df_v2_d["date"] <= yr_end
+            if mask.sum() == 0:
+                continue
+            last = df_v2_d[mask].iloc[-1]
+            fig_v2.add_annotation(
+                x=last["date"], y=last["equity"],
+                text=f"{yr_ret_ann:+.0f}%",
+                showarrow=True, arrowhead=2, arrowcolor="#f0a500",
+                font=dict(color="#f0a500", size=10), ax=0, ay=-35,
+            )
+
+        fig_v2.update_layout(
+            title="Strategy V2（$4,000スタート）資産推移",
+            xaxis_title="日付", yaxis_title="残高 ($)",
+            yaxis_tickformat="$,.0f",
+            hovermode="x unified", height=500,
+            legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.5)"),
+        )
+        st.plotly_chart(fig_v2, use_container_width=True)
+
+        # 年別リターン棒グラフ
+        yr_list_v2 = sorted(yr_rets_v2.keys())
+        yr_vals_v2 = [yr_rets_v2[yr] for yr in yr_list_v2]
+        yr_base_vals = []
+        if etf_available:
+            for yr in yr_list_v2:
+                yr_base_vals.append(yr_rets_etf.get(yr, 0.0))
+
+        fig_yr = go.Figure()
+        fig_yr.add_trace(go.Bar(
+            x=[str(y) for y in yr_list_v2], y=yr_vals_v2,
+            name="V2-低リスク", marker_color="#f0a500", opacity=0.85,
+            text=[f"{v:+.1f}%" for v in yr_vals_v2],
+            textposition="outside",
+        ))
+        if yr_base_vals:
+            fig_yr.add_trace(go.Bar(
+                x=[str(y) for y in yr_list_v2], y=yr_base_vals,
+                name="ベースライン ETF v2", marker_color="#7ee787", opacity=0.6,
+            ))
+        fig_yr.add_hline(y=0, line_color="#6e7681", line_width=1)
+        fig_yr.update_layout(
+            title="年別リターン", barmode="group",
+            yaxis_tickformat="+.0f%", height=360,
+            legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.5)"),
+        )
+        st.plotly_chart(fig_yr, use_container_width=True)
+
+        st.divider()
+
+        # 取引履歴
+        st.subheader("取引履歴（全件）")
+
+        v2_f1, v2_f2, v2_f3 = st.columns(3)
+        with v2_f1:
+            yr_opts_v2 = ["全件"] + sorted(df_v2_tr["entry_date"].str[:4].unique().tolist(), reverse=True)
+            yr_sel_v2  = st.selectbox("年フィルター", yr_opts_v2, key="v2_yr")
+        with v2_f2:
+            sort_v2 = st.selectbox("並び替え", ["entry_date", "pl_pct", "holding_days", "ticker"], key="v2_sort")
+        with v2_f3:
+            win_v2 = st.selectbox("勝敗", ["全件", "勝ち", "負け"], key="v2_win")
+
+        disp_v2 = df_v2_tr.copy()
+        if yr_sel_v2 != "全件":
+            disp_v2 = disp_v2[disp_v2["entry_date"].str.startswith(yr_sel_v2)]
+        if win_v2 == "勝ち":
+            disp_v2 = disp_v2[disp_v2["pl_pct"] > 0]
+        elif win_v2 == "負け":
+            disp_v2 = disp_v2[disp_v2["pl_pct"] <= 0]
+        disp_v2 = disp_v2.sort_values(sort_v2, ascending=(sort_v2 not in ["pl_pct"]))
+
+        n_wins_v2 = (disp_v2["pl_pct"] > 0).sum()
+        avg_pl_v2 = disp_v2["pl_pct"].mean()
+        st.caption(
+            f"{len(disp_v2)} 件  |  "
+            f"勝ち {n_wins_v2} / 負け {len(disp_v2) - n_wins_v2}  |  "
+            f"avg P/L {avg_pl_v2:+.2f}%"
+        )
+
+        disp_v2_show = disp_v2[[
+            "entry_date", "exit_date", "ticker", "pl_pct", "holding_days",
+            "entry_price", "exit_price", "allocated",
+        ]].copy()
+        disp_v2_show.columns = [
+            "エントリー日", "エグジット日", "銘柄", "損益%", "保有日数",
+            "買値$", "売値$", "投資額$",
+        ]
+        disp_v2_show["損益%"]   = disp_v2_show["損益%"].map(lambda x: f"{x:+.2f}%")
+        disp_v2_show["買値$"]   = disp_v2_show["買値$"].map(lambda x: f"${x:.2f}")
+        disp_v2_show["売値$"]   = disp_v2_show["売値$"].map(lambda x: f"${x:.4f}")
+        disp_v2_show["投資額$"] = disp_v2_show["投資額$"].map(lambda x: f"${x:,.0f}")
+
+        st.dataframe(disp_v2_show, use_container_width=True, hide_index=True)
+
+        # P/L分布ヒストグラム
+        st.subheader("P/L 分布")
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(
+            x=df_v2_tr["pl_pct"],
+            nbinsx=40,
+            marker_color=np.where(df_v2_tr["pl_pct"] > 0, "#7ee787", "#f85149").tolist(),
+            name="P/L分布",
+        ))
+        fig_hist.add_vline(x=0, line_color="#6e7681", line_dash="dash")
+        fig_hist.update_layout(
+            xaxis_title="P/L (%)", yaxis_title="件数",
+            height=320, showlegend=False,
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)

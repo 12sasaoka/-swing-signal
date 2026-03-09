@@ -27,6 +27,12 @@ output/backtest/*.csv
 output/backtest/*.png
 output/results/
 
+# ダッシュボード用データは追跡対象（例外）
+!output/backtest/etf_v2_weekly_daily.csv
+!output/backtest/etf_v2_txn_history.csv
+!output/backtest/v2_lowrisk_daily.csv
+!output/backtest/v2_etf_overlay_trades.csv
+
 # Claude Code 設定（ローカル専用）
 .claude/settings.local.json
 
